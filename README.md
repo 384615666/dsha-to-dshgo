@@ -1,4 +1,4 @@
-# DSHA 迁移 / dsh-dsha-migrator
+# DSHA 迁移 / dsha-to-dshgo
 
 [中文](#中文) | [English](#english)
 
