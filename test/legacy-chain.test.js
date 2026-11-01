@@ -354,3 +354,48 @@ test('CHILD_EVIDENCE: parent rows + matching fact restore to v4; unrelated fact 
   const canonicalOther = await encodeCanonicalV4AndSelfCheck(tolerated.artifact)
   assert.equal(canonicalOther.headerRow.version, 4)
 })
+
+test('v1 raw physical rows: shared-layout header + rows decode through the official v1 codec', async () => {
+  if (skip) return
+  // v1 codec is decode-only (no encode); rows are the shared physical layout
+  // built by hand per DSHA's test harness shape.
+  const req = createRequire(join(rc4Dir, 'noop.js'))
+  const v0mod = await import(pathToFileURL(req.resolve('@deepseek-ai/dsh-session-format-v0-to-v1')).href)
+  const codec = v0mod.releasedV1SessionFormatCodec
+
+  const header = { type: 'session', version: 1, id: 'session-synth-v1', createdAt: 1793500000000, cwd: '/tmp/proj', delegationDepth: 0 }
+  // Classification of the raw v1 header via the historical catalog.
+  const { classifyHeader } = await loadChain()
+  const cls = await classifyHeader(header)
+  // classifyHeader picks the catalog by version: for v1 the CURRENT catalog
+  // says migration-required (valid v1, needs upgrade to v4) — exactly right.
+  assert.ok(['migration-required', 'current'].includes(cls.status), `v1 header status ${cls.status}: ${cls.reason ?? ''}`)
+
+  // Raw v1 physical rows (shared layout; one event per row for this shape).
+  const e = (type, seq, data, extra = {}) => ({ type, seq, time: seq + 100, data, ...extra })
+  // v1 surface rows require an open step (same chronology rule as v2+).
+  const rows = [
+    e('turn/start', 0, { turn: 1 }),
+    e('step/start', 1, { turn: 1, step: 1 }),
+    e('user/message', 2, { id: 'v1-user', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '保留这句话' }] }, { surfaceOp: 'append' }),
+    e('step/end', 3, { turn: 1, step: 1 }),
+    e('turn/end', 4, { turn: 1, reason: { kind: 'completed' } }),
+  ]
+
+  // Official decode with the emitEvent context contract (v0/v1 codec).
+  const decoder = codec.createDecoder(header, 'strict')
+  const events = []
+  const context = { emitEvent: ev => events.push(ev) }
+  for (const row of rows) decoder.decodeRow(row, context)
+  decoder.finish(context)
+  assert.equal(events.length, rows.length)
+
+  // Then through the canonical v4 chain (catalog createRestore emits events
+  // the same way — restoreArtifact normalizes both shapes).
+  const { migrateToV4 } = await loadChain()
+  const out = await migrateToV4(header, rows, { childFacts: [] })
+  assert.equal(out.sourceVersion, 1)
+  assert.ok(out.eventRows.length >= rows.length, `expected >= ${rows.length} canonical events`)
+  assert.equal(out.headerRow.version, 4)
+  assert.equal(out.headerRow.id, 'session-synth-v1')
+})
