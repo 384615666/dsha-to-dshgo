@@ -19,14 +19,14 @@ test('real backup verifies fully', { skip: !REAL || !existsSync(REAL) }, async (
   assert.equal(r.manifest.operation, 'EXPORT')
   assert.equal(r.stats.fileEntries, r.manifest.entries - 33) // 181 files of 214 records
   assert.equal(r.stats.fileVerified, r.stats.fileEntries)
-  assert.equal(r.stats.fileFailures, 0)
+  assert.equal(r.stats.fileFailures ?? 0, 0)
   assert.ok(r.stats.readmeBytes <= r.limits.maxReadmeBytes)
 })
 
 test('valid large sample (>8 MiB, legal README) verifies fully', { skip: !FIX || !existsSync(join(FIX, 'valid-large..gz')) }, async () => {
   const r = await readV5Backup(join(FIX, 'valid-large..gz'))
   assert.equal(r.manifest.formatVersion, 5)
-  assert.equal(r.stats.fileFailures, 0)
+  assert.equal(r.stats.fileFailures ?? 0, 0)
   assert.equal(r.stats.fileVerified, r.stats.fileEntries)
   assert.ok(r.stats.readmeBytes <= r.limits.maxReadmeBytes)
 })
