@@ -1,0 +1,61 @@
+{
+  "name": "@dsha-migration/dsh-dsha-migrator",
+  "version": "0.1.0-p0.1",
+  "description": "Migrate DSHA one-click backup sessions into official dsh-Go. 将 DSHA 一键备份的会话迁移到官方 dsh-Go。",
+  "license": "MIT",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "README.md",
+    "README.en.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "check": "node \"../dsh-Go/sdk/plugin-kit/bin/check.mjs\" . --load"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "dshGo": {
+    "v": 1,
+    "minApp": "1.0.4",
+    "title": {
+      "zh": "DSHA 迁移",
+      "en": "DSHA migration"
+    },
+    "icon": "zip",
+    "capabilities": [
+      "files"
+    ],
+    "wants": [],
+    "contributes": {
+      "panels": [
+        {
+          "id": "migration",
+          "title": {
+            "zh": "DSHA 迁移",
+            "en": "DSHA migration"
+          },
+          "icon": "zip",
+          "placement": [
+            "features"
+          ]
+        }
+      ]
+    }
+  },
+  "engines": {
+    "node": ">=22.19",
+    "dsh": ">=0.2.1-rc.4 <0.3.0-0"
+  },
+  "author": "384615666"
+}
