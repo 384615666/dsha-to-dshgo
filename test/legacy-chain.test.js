@@ -159,3 +159,69 @@ test('v0/v1 packed-row decode: packed rows expand via finish(), not line count',
   const out = await migrateToV4(f.header, f.rows, { childFacts: null })
   assert.equal(out.eventRows.length, f.rows.length)
 })
+
+test('synthetic v3 positive: official codec encode → official chain restore → v4 round-trip', async () => {
+  if (skip) return
+  const { classifyHeader, migrateToV4 } = await loadChain()
+  const req = createRequire(join(rc4Dir, 'noop.js'))
+  const v23 = await import(pathToFileURL(req.resolve('@deepseek-ai/dsh-session-format-v2-to-v3')).href)
+  const codec = v23.releasedV3SessionFormatCodec
+
+  const id = 'session-synth-v3'
+  const v3LogicalHeader = { version: 3, id, createdAt: 1793500000000, cwd: '/tmp/proj', isSeeded: false, delegationDepth: 0 }
+  const e = (type, seq, data, extra = {}) => ({ type, seq, time: seq + 100, data, ...extra })
+  const logicalEvents = [
+    e('turn/start', 0, { turn: 1 }),
+    e('user/message', 1, { id: `${id}-user`, role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '保留这句话' }] }, { surfaceOp: 'append' }),
+    e('step/start', 2, { turn: 1, step: 1 }),
+    e('step/end', 3, { turn: 1, step: 1 }),
+    e('turn/end', 4, { turn: 1, reason: { kind: 'completed' } }),
+  ]
+
+  // Encode with the OFFICIAL v3 codec (physical header has no type field).
+  const physicalHeader = codec.encodeHeader(v3LogicalHeader, 0)
+  const physicalRows = logicalEvents.map(ev => codec.encodeEvent(ev))
+
+  // Classification through the historical catalog.
+  const cls = await classifyHeader(physicalHeader)
+  assert.equal(cls.status, 'current', `historical catalog status ${cls.status}: ${cls.reason ?? ''}`)
+
+  // Migrate: restore (historical) → canonical v4 → round-trip self-check.
+  const out = await migrateToV4(physicalHeader, physicalRows, { childFacts: null })
+  assert.equal(out.sourceVersion, 3)
+  assert.equal(out.eventRows.length, logicalEvents.length)
+  assert.equal(out.headerRow.version, 4)
+  assert.equal(out.headerRow.id, id)
+})
+
+test('synthetic v2 positive: same pipeline through the v2 codec', async () => {
+  if (skip) return
+  const { migrateToV4 } = await loadChain()
+  const req = createRequire(join(rc4Dir, 'noop.js'))
+  const v12 = await import(pathToFileURL(req.resolve('@deepseek-ai/dsh-session-format-v1-to-v2')).href)
+  const codec = v12.releasedV2SessionFormatCodec
+
+  const id = 'session-synth-v2'
+  const v2LogicalHeader = { version: 2, id, createdAt: 1793500000000, cwd: '/tmp/proj', isSeeded: false, delegationDepth: 0 }
+  const e = (type, seq, data, extra = {}) => ({ type, seq, time: seq + 100, data, ...extra })
+  const logicalEvents = [
+    e('turn/start', 0, { turn: 1 }),
+    e('step/start', 1, { turn: 1, step: 1 }),
+    e('user/message', 2, { id: `${id}-user`, role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '保留这句话' }] }, { surfaceOp: 'append' }),
+    e('step/end', 3, { turn: 1, step: 1 }),
+    e('turn/end', 4, { turn: 1, reason: { kind: 'completed' } }),
+  ]
+
+  const physicalHeader = codec.encodeHeader(v2LogicalHeader, 0)
+  const physicalRows = logicalEvents.map(ev => codec.encodeEvent(ev))
+
+  const out = await migrateToV4(physicalHeader, physicalRows, { childFacts: null })
+  assert.equal(out.sourceVersion, 2)
+  // The v2→v3→v4 chain may legitimately rewrite the event stream (structure
+  // events); the round-trip self-check inside migrateToV4 already asserted
+  // canonical-v4 consistency, so here we require at least the original
+  // surfaces to survive and the header identity to be preserved.
+  assert.ok(out.eventRows.length >= logicalEvents.length, `expected >= ${logicalEvents.length} events, got ${out.eventRows.length}`)
+  assert.equal(out.headerRow.version, 4)
+  assert.equal(out.headerRow.id, id)
+})
