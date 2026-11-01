@@ -6,7 +6,7 @@
 
 ## 中文
 
-把 **DSHA**（DeepSeek Harness Android 端）「一键备份」导出的会话备份，迁移到 **官方 dsh-Go** 的 DSH bundle 插件。迁移完成后，会话直接出现在 dsh-Go 原生会话列表中：正文、工具历史、标题可读，重启后仍在，可继续发消息。
+把 **DSHA**（DeepSeek Harness Android 端）「一键备份」导出的会话备份，迁移到 **dsh-Go** 的 DSH bundle 插件。迁移完成后，会话直接出现在 dsh-Go 原生会话列表中：正文、工具历史、标题可读，重启后仍在，可继续发消息。
 
 - 不改 APK、不 Root、不 ADB 私有目录拷贝、不用电脑端工具作为最终方案。
 - 插件只处理用户明确选择的备份文件；**所有解析、暂存与写入都发生在设备本机**，不联网上传任何聊天数据。
@@ -24,7 +24,7 @@
 
 尚未实现：完整备份解析（P1）、端到端迁移与回滚（P2）、正式 UI（P3）、npm 发布（P4/P5）。开发路线与验收标准见内部规划文档（不含于本仓库）。
 
-### 开发期安装（官方 dsh-Go，无需 Root）
+### 开发期安装（dsh-Go，无需 Root）
 
 ```sh
 # 桌面 web profile
@@ -52,7 +52,7 @@ dsh plugin --profile web add /root/.dsh/dsh-go/plugins/dsh-dsha-migrator
 ### 兼容性
 
 - 目标引擎：`>=0.2.1-rc.4 <0.3.0-0`（证据基线为 rc.4）；App `minApp 1.0.4`（已在 1.0.7 实测）。
-- 输入：DSHA 一键备份 v5（按 gzip magic 识别，接受 `..gz` 等非常规扩展名）；会话格式 v0–v4 直接支持在路线图中（旧代经官方迁移链升级为 v4）。
+- 输入：DSHA 一键备份 v5（按 gzip magic 识别，接受 `..gz` 等非常规扩展名）；会话格式 v0–v4 直接支持在路线图中（旧代经 dsh-Go 自带迁移链升级为 v4）。
 
 ### 数据与隐私
 
@@ -68,7 +68,7 @@ dsh plugin --profile web add /root/.dsh/dsh-go/plugins/dsh-dsha-migrator
 
 ## English
 
-A DSH bundle plugin that migrates sessions from a **DSHA** one-click backup into **official dsh-Go**. Migrated sessions appear in the native dsh-Go session list with full message/tool history, survive restarts, and can continue chatting.
+A DSH bundle plugin that migrates sessions from a **DSHA** one-click backup into **dsh-Go**. Migrated sessions appear in the native dsh-Go session list with full message/tool history, survive restarts, and can continue chatting.
 
 **Status: P0 prototype.** Verified against a real isolated rc.4 Host and a real Android (ARM64 PRoot) device: runtime capability check (`locate` available), A-path service replay (full readback hash match; renaming session IDs is rejected by delivery-marker validation — the migration preserves source IDs), B-path file placement (immediately visible in `list()`, readable after restart), minimal G6 snapshot/rollback, and both input channels (system files picker ≤8 MiB and `/sdcard` streaming >8 MiB, SHA-256 verified).
 
