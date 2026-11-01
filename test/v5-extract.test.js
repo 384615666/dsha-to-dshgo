@@ -4,7 +4,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { Writable } from 'node:stream'
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs'
+import { mkdtempSync, writeFileSync, rmSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createHash } from 'node:crypto'
@@ -281,6 +281,50 @@ test('after failure: zero residual listeners and no writes to the destroyed sink
     assert.equal(writesAfterDestroy, 0, `no write() may reach the sink after it errored/was destroyed (got ${writesAfterDestroy})`)
   } finally {
     sink.destroy()
+    rmSync(file, { force: true })
+  }
+})
+
+test('staging integration: sessions root extracted to private dir, other roots ignored', async () => {
+  const { SessionStaging } = await import('../lib/archive/session-staging.js')
+  // Each root carries exactly one scope (reader validates per-root scope
+  // consistency against the manifest, matching the source packager).
+  const entries = [
+    fileEntry('sessions', 'proj-a/session-aaa/session.v4.jsonl.zstd', Buffer.from('session-aaa-payload'), 'sessions'),
+    fileEntry('sessions', 'proj-a/session-bbb/session.v4.jsonl.zstd', Buffer.from('session-bbb-payload'), 'sessions'),
+    fileEntry('storages', 'workspace.json', Buffer.from('{"unit":"workspace"}'), 'sessions'),
+    fileEntry('settings', 'app.cfg', Buffer.from('cfg'), 'settings'),
+    { meta: { root: 'sessions', path: 'proj-a/session-ccc/session.v4.jsonl.zstd', kind: 'MISSING', scope: 'sessions', size: 0, sha256: '' } },
+  ]
+  // manifest.roots is derived per-root; scopes application is exempt from
+  // the per-root scope check, and the fixture helper already collects the
+  // roots from entries — nothing extra needed. (Kept as a note: the earlier
+  // ROOT_SCOPE_MISMATCH came from mixing scopes under one root.)
+  const gz = buildV5Archive(entries, { manifest: { integrity: 'PARTIAL' } })
+  const file = join(tmpdir(), `v5-stage-${Date.now()}.gz`)
+  writeFileSync(file, gz)
+  const stagingRoot = join(tmpdir(), `v5-stage-dir-${Date.now()}`)
+  const staging = new SessionStaging(stagingRoot)
+  await staging.prepare()
+  try {
+    const r = await readV5Backup(file, { makeSink: staging.makeSinkFactory() })
+    // FILE records: 2 session files + workspace.json + app.cfg (MISSING is
+    // not a FILE record).
+    assert.equal(r.stats.fileVerified, 4)
+    const { staged, failed } = await staging.verifyAll()
+    // Only the sessions root reached staging: storages/settings must not.
+    assert.equal(staged.length, 2)
+    assert.equal(failed.length, 0)
+    const bodies = staged.map(e => readFileSync(e.stagedTo).toString())
+    assert.deepEqual(bodies.sort(), ['session-aaa-payload', 'session-bbb-payload'])
+    for (const e of staged) {
+      assert.ok(e.stagedTo.startsWith(staging.root), 'staged file must stay inside the staging root')
+      assert.match(e.path, /^proj-a\//)
+    }
+    // Nothing from other roots landed on disk.
+    for (const e of staged) assert.ok(!e.path.startsWith('storages') && !e.path.startsWith('settings'))
+  } finally {
+    await staging.cleanupAll()
     rmSync(file, { force: true })
   }
 })
