@@ -1,6 +1,6 @@
 {
   "name": "@dsha-migration/dsh-dsha-migrator",
-  "version": "0.1.0-p1.7",
+  "version": "0.1.0-p1.8",
   "description": "Migrate DSHA one-click backup sessions into official dsh-Go. 将 DSHA 一键备份的会话迁移到官方 dsh-Go。",
   "license": "MIT",
   "type": "module",
@@ -19,7 +19,8 @@
   ],
   "scripts": {
     "test": "node --test \"test/*.test.js\"",
-    "check": "node \"../dsh-Go/sdk/plugin-kit/bin/check.mjs\" . --load"
+    "check": "node \"../dsh-Go/sdk/plugin-kit/bin/check.mjs\" . --load",
+    "_resolve_rc4": "node scripts/check-rc4.mjs"
   },
   "dsh": {
     "bundle": {
