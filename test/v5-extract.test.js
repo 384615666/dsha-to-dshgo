@@ -140,3 +140,58 @@ test('sink failing DURING payload writes rejects cleanly (no unhandled error, no
     rmSync(file, { force: true })
   }
 })
+
+test('premature sink close (destroy before finish) rejects as ERR_STREAM_PREMATURE_CLOSE', async () => {
+  const gz = buildV5Archive([fileEntry('plugins', 'tiny.bin', Buffer.from('abc'))])
+  const file = join(tmpdir(), `v5-pc-${Date.now()}.gz`)
+  writeFileSync(file, gz)
+  // Standard Writable destroyed asynchronously BEFORE its write callback
+  // completes: close fires, finish never does, writableFinished stays false.
+  const sink = new Writable({
+    highWaterMark: 16 * 1024,
+    write(chunk, _enc, cb) {
+      setTimeout(() => {
+        sink.destroy()
+        // cb intentionally never called: the stream dies mid-write.
+      }, 5)
+    },
+  })
+  try {
+    await assert.rejects(
+      () => readV5Backup(file, { makeSink: () => sink }),
+      error => error.code === 'ERR_STREAM_PREMATURE_CLOSE' || /PREMATURE_CLOSE/.test(error.message),
+    )
+    assert.equal(sink.writableFinished, false, 'sink must not have finished')
+  } finally {
+    rmSync(file, { force: true })
+  }
+})
+
+test('successful extraction leaves no residual poller timers', async () => {
+  // Reviewer counterexample: after a normal ~2 MiB extraction two internal
+  // 5 ms intervals were still alive (the losing drain-race branch never
+  // cleared its poller).
+  const payload = Buffer.alloc(2 * 1024 * 1024 + 3, 0x41)
+  const gz = buildV5Archive([fileEntry('plugins', 'two-mib.bin', payload)])
+  const file = join(tmpdir(), `v5-poll-${Date.now()}.gz`)
+  writeFileSync(file, gz)
+  const sink = new Writable({
+    highWaterMark: 16 * 1024,
+    write(chunk, _enc, cb) {
+      setImmediate(cb)
+    },
+  })
+  try {
+    const r = await readV5Backup(file, { makeSink: () => sink })
+    assert.equal(r.stats.fileVerified, 1)
+    // Count our own poller intervals: a real Writable only ever emits drain
+    // (no polling needed on the happy path), so zero pollers must remain.
+    await new Promise(r => setTimeout(r, 30))
+    assert.ok(
+      sink.listenerCount('drain') === 0,
+      `drain listeners left: ${sink.listenerCount('drain')}`,
+    )
+  } finally {
+    rmSync(file, { force: true })
+  }
+})

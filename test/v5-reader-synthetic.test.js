@@ -155,54 +155,34 @@ test('cumulative payload budget is enforced across records', async () => {
 })
 
 test('slow sink stays within its own buffering budget (backpressure honored)', async () => {
+  const { Writable } = await import('node:stream')
   const payload = Buffer.alloc(8 * 1024 * 1024, 0x41)
   const gz = buildV5Archive([fileEntry('plugins', 'big.bin', payload)])
   const file = join(tmpdir(), `v5-bp-${Date.now()}.gz`)
   writeFileSync(file, gz)
   let maxQueued = 0
   let queued = 0
-  const listeners = {}
-  const timers = []
-  const sink = {
+  // REAL Writable with a deliberately slow consumer: each write drains on a
+  // later tick (16 KiB at a time), exercising the reader's drain path and
+  // finish/close semantics exactly like production extraction will.
+  const sink = new Writable({
     highWaterMark: 16 * 1024,
-    write(chunk) {
+    write(chunk, _enc, cb) {
       queued += chunk.length
       if (queued > maxQueued) maxQueued = queued
-      // Drain asynchronously: a real sink at/below its high-water mark frees
-      // the accepted bytes and emits drain once.
       setImmediate(() => {
         queued = 0
-        for (const fn of listeners.drain ?? []) fn()
+        cb()
       })
-      return false
     },
-    emit(event, ...args) {
-      for (const fn of listeners[event] ?? []) fn(...args)
-    },
-    end(cb) {
-      for (const t of timers) clearInterval(t)
-      cb?.()
-      for (const fn of listeners.close ?? []) fn()
-    },
-    on(event, fn) {
-      (listeners[event] ??= []).push(fn)
-    },
-    once(event, fn) {
-      (listeners[event] ??= []).push(fn)
-    },
-    removeListener(event, fn) {
-      listeners[event] = (listeners[event] ?? []).filter(f => f !== fn)
-    },
-    destroy() {
-      for (const t of timers) clearInterval(t)
-    },
-  }
+  })
   try {
     const r = await readV5Backup(file, { makeSink: () => sink })
     assert.equal(r.stats.fileVerified, 1)
-    // Bound = one feed chunk (≤1 MiB) + one drained step: the reader must
-    // wait for drain after every refused write, never queue ahead. The
-    // pre-fix peak was 3,145,728 B with an identical mock.
+    assert.equal(sink.writableFinished, true, 'sink must have finished properly')
+    // Bound = one feed chunk (≤1 MiB) + a drained step: the reader must wait
+    // for drain after every refused write, never queue ahead. The pre-fix
+    // peak was 3,145,728 B and grew without bound.
     assert.ok(
       maxQueued <= 2 * 1024 * 1024,
       `sink queue must stay bounded (peak ${maxQueued} bytes; pre-fix peak was 3,145,728)`,
