@@ -195,3 +195,49 @@ test('successful extraction leaves no residual poller timers', async () => {
     rmSync(file, { force: true })
   }
 })
+
+test('premature close while backpressured (large file, no drain/error after destroy) rejects without hanging', async () => {
+  // Reviewer counterexample: file > sink high-water mark so write() returns
+  // false, then the sink is destroyed WITHOUT error or drain. The reader is
+  // parked in drainWait at that moment — before sinkEnd ever runs — so the
+  // premature-close detection must live at sink creation and wake the
+  // drain wait. Pre-fix behavior: promise never settles (2 s timeout).
+  const payload = Buffer.alloc(2 * 1024 * 1024 + 7, 0x41) // > 16 KiB HWM
+  const gz = buildV5Archive([fileEntry('plugins', 'big-pc.bin', payload)])
+  const file = join(tmpdir(), `v5-pcbp-${Date.now()}.gz`)
+  writeFileSync(file, gz)
+  const { Writable } = await import('node:stream')
+  let writes = 0
+  let sawBackpressure = false
+  const sink = new Writable({
+    highWaterMark: 16 * 1024,
+    write(chunk, _enc, cb) {
+      writes += 1
+      // Never call cb: after the first write the stream stays backpressured
+      // and no drain will ever fire.
+      if (writes >= 2) sawBackpressure = true
+    },
+  })
+  // Emulate the host/disk layer force-closing the sink while it is stuck
+  // backpressured: destroy() without error drains nothing and emits only
+  // 'close' (writableFinished stays false).
+  const destroyTimer = setTimeout(() => sink.destroy(), 50)
+  destroyTimer.unref?.()
+  const kill = setTimeout(() => {
+    assert.fail(`reader hung instead of rejecting (writes=${writes}, sawBackpressure=${sawBackpressure})`)
+  }, 5000)
+  try {
+    await assert.rejects(
+      () => readV5Backup(file, { makeSink: () => sink }),
+      error => error.code === 'ERR_STREAM_PREMATURE_CLOSE' || /PREMATURE_CLOSE/.test(error.message),
+    )
+    clearTimeout(kill)
+    assert.ok(writes >= 1, 'at least one write must have happened before the close')
+    assert.equal(sink.writableFinished, false, 'sink must not have finished')
+  } finally {
+    clearTimeout(kill)
+    clearTimeout(destroyTimer)
+    sink.destroy()
+    rmSync(file, { force: true })
+  }
+})
