@@ -225,3 +225,62 @@ test('synthetic v2 positive: same pipeline through the v2 codec', async () => {
   assert.equal(out.headerRow.version, 4)
   assert.equal(out.headerRow.id, id)
 })
+
+test('v3 parent with subagent child: child facts restore the parent to v4', async () => {
+  if (skip) return
+  const chain = await loadChain()
+  const { classifyHeader, restoreArtifact, childFactsFromArtifacts, restoreParentWithChildren, encodeCanonicalV4AndSelfCheck, LEGACY_CODES } = chain
+  const req = createRequire(join(rc4Dir, 'noop.js'))
+  const cat = await import(pathToFileURL(req.resolve('@deepseek-ai/dsh-session-format-catalog')).href)
+  const e = (type, seq, data, extra = {}) => ({ type, seq, time: seq + 100, data, ...extra })
+
+  // Child: subagent origin, parentSession pointing at the parent.
+  const childHeader = { type: 'session', version: 3, id: 'session-child', createdAt: 1793500000500, cwd: '/tmp/proj', isSeeded: false, delegationDepth: 1, origin: 'subagent', parentSession: 'session-parent' }
+  const childRows = [
+    e('turn/start', 0, { turn: 1 }),
+    e('step/start', 1, { turn: 1, step: 1 }),
+    e('step/end', 2, { turn: 1, step: 1 }),
+    e('turn/end', 3, { turn: 1, reason: { kind: 'completed' } }),
+  ]
+  const child = await restoreArtifact(childHeader, childRows)
+  assert.equal(child.usedHistorical, true)
+  const facts = await childFactsFromArtifacts([child.artifact])
+  assert.equal(facts.length, 1)
+  assert.equal(facts[0].childId, 'session-child')
+
+  // Parent restores to v4 with the child facts bound.
+  const parentHeader = { type: 'session', version: 3, id: 'session-parent', createdAt: 1793500000000, cwd: '/tmp/proj', isSeeded: false, delegationDepth: 0 }
+  const parentRows = [
+    e('turn/start', 0, { turn: 1 }),
+    e('step/start', 1, { turn: 1, step: 1 }),
+    e('user/message', 2, { id: 'p-user', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '保留这句话' }] }, { surfaceOp: 'append' }),
+    e('step/end', 3, { turn: 1, step: 1 }),
+    e('turn/end', 4, { turn: 1, reason: { kind: 'completed' } }),
+  ]
+  const parent = await restoreParentWithChildren(parentHeader, parentRows, facts)
+  const canonical = await encodeCanonicalV4AndSelfCheck(parent.artifact)
+  assert.equal(canonical.headerRow.version, 4)
+  assert.equal(canonical.headerRow.id, 'session-parent')
+  void classifyHeader
+  void LEGACY_CODES
+})
+
+test('v3 parent restore still works when the archive declares no direct children (empty set)', async () => {
+  if (skip) return
+  const { restoreParentWithChildren, encodeCanonicalV4AndSelfCheck } = await loadChain()
+  const e = (type, seq, data, extra = {}) => ({ type, seq, time: seq + 100, data, ...extra })
+  const parentHeader = { type: 'session', version: 3, id: 'session-solo', createdAt: 1793500000000, cwd: '/tmp/proj', isSeeded: false, delegationDepth: 0 }
+  const parentRows = [
+    e('turn/start', 0, { turn: 1 }),
+    e('step/start', 1, { turn: 1, step: 1 }),
+    e('user/message', 2, { id: 's-user', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'solo' }] }, { surfaceOp: 'append' }),
+    e('step/end', 3, { turn: 1, step: 1 }),
+    e('turn/end', 4, { turn: 1, reason: { kind: 'completed' } }),
+  ]
+  // Explicit empty child set — a statement from the backup manifest, not a
+  // placeholder for unknowns.
+  const parent = await restoreParentWithChildren(parentHeader, parentRows, [])
+  const canonical = await encodeCanonicalV4AndSelfCheck(parent.artifact)
+  assert.equal(canonical.headerRow.version, 4)
+  assert.equal(canonical.headerRow.id, 'session-solo')
+})
