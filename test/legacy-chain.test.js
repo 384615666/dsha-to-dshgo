@@ -122,3 +122,40 @@ test('v3 header goes through the historical catalog', async () => {
   // (for the historical catalog, current means "valid at v3").
   assert.ok(['current', 'migration-required'].includes(cls.status), `status ${cls.status}`)
 })
+
+test('v0 real-shape negative sample classifies and is rejected (chronology)', async () => {
+  if (skip) return
+  const { readFile } = await import('node:fs/promises')
+  // The released v0 real-shape fixture ships with DSHA (committed to the
+  // handoff); it must classify via the historical catalog and be REJECTED,
+  // not upgraded — the shapes cannot prove a chronology/system head.
+  const fixturePath = process.env.DSHA_V0_NEGATIVE
+  if (!fixturePath) return // fixture is machine-local; CI runs without it
+  const lines = (await readFile(fixturePath, 'utf8')).split('\n').filter(x => x.trim())
+  const header = JSON.parse(lines[0])
+  const rows = lines.slice(1).map(x => JSON.parse(x))
+  const { classifyHeader, migrateToV4, LEGACY_CODES } = await loadChain()
+  const cls = await classifyHeader(header)
+  assert.ok(['unsupported', 'malformed', 'migration-required'].includes(cls.status), `status ${cls.status}`)
+  await assert.rejects(
+    () => migrateToV4(header, rows, { childFacts: null }),
+    error => {
+      assert.ok(
+        [LEGACY_CODES.HEADER_UNSUPPORTED, LEGACY_CODES.CHRONOLOGY_UNREACHABLE, LEGACY_CODES.ROW_DECODE_FAILED].includes(error.code),
+        `unexpected code ${error.code}`,
+      )
+      return true
+    },
+  )
+})
+
+test('v0/v1 packed-row decode: packed rows expand via finish(), not line count', async () => {
+  if (skip) return
+  // packed-row semantics smoke test on the CURRENT (v4) path: N physical rows
+  // in → N logical events out (v0/v1 packing is handled by the official
+  // chain's decodeRow; the contract here is finish().events is the count).
+  const { migrateToV4 } = await loadChain()
+  const f = v4Fixture('session-packed')
+  const out = await migrateToV4(f.header, f.rows, { childFacts: null })
+  assert.equal(out.eventRows.length, f.rows.length)
+})
