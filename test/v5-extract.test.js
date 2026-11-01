@@ -241,3 +241,46 @@ test('premature close while backpressured (large file, no drain/error after dest
     rmSync(file, { force: true })
   }
 })
+
+test('after failure: zero residual listeners and no writes to the destroyed sink', async () => {
+  // Reviewer counterexample: after fail(), one drain listener stayed on the
+  // destroyed sink; if the internal buffer still held bytes, write() was
+  // called again on it (residual grew to 2). Both must be impossible.
+  const payload = Buffer.alloc(3 * 1024 * 1024 + 5, 0x42) // buffer will hold leftovers
+  const gz = buildV5Archive([fileEntry('plugins', 'fail.bin', payload)])
+  const file = join(tmpdir(), `v5-resid-${Date.now()}.gz`)
+  writeFileSync(file, gz)
+  let writes = 0
+  let writesAfterDestroy = 0
+  let destroyed = false
+  let errorDelivered = false
+  const sink = new Writable({
+    highWaterMark: 16 * 1024,
+    write(chunk, _enc, cb) {
+      writes += 1
+      if (destroyed) writesAfterDestroy += 1
+      if (writes === 2 && !errorDelivered) {
+        // ENOSPC mid-payload via the write callback.
+        errorDelivered = true
+        cb(new Error('synthetic ENOSPC during payload write'))
+        // Simulate the stream's own teardown after the error.
+        process.nextTick(() => sink.destroy())
+        return
+      }
+      setTimeout(cb, 1)
+    },
+  })
+  sink.on('error', () => {}) // reader owns the error path; keep stream quiet
+  try {
+    await assert.rejects(
+      () => readV5Backup(file, { makeSink: () => sink }),
+      /synthetic ENOSPC during payload write/,
+    )
+    await new Promise(r => setTimeout(r, 50))
+    assert.equal(sink.listenerCount('drain'), 0, `drain listeners must be fully detached (got ${sink.listenerCount('drain')})`)
+    assert.equal(writesAfterDestroy, 0, `no write() may reach the sink after it errored/was destroyed (got ${writesAfterDestroy})`)
+  } finally {
+    sink.destroy()
+    rmSync(file, { force: true })
+  }
+})
