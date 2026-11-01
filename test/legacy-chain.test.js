@@ -284,3 +284,73 @@ test('v3 parent restore still works when the archive declares no direct children
   assert.equal(canonical.headerRow.version, 4)
   assert.equal(canonical.headerRow.id, 'session-solo')
 })
+
+test('CHILD_EVIDENCE: parent rows carry subagent/catalog but no fact bound → official chain refuses', async () => {
+  if (skip) return
+  const { restoreParentWithChildren, LEGACY_CODES } = await loadChain()
+  const e = (type, seq, data, extra = {}) => ({ type, seq, time: seq + 100, data, ...extra })
+  const parentHeader = { type: 'session', version: 3, id: 'p-ev', createdAt: 1, cwd: '/w', isSeeded: false, delegationDepth: 0 }
+  const rows = [
+    e('turn/start', 0, { turn: 1 }),
+    // The parent declares a subagent child in its own rows, but the caller
+    // binds an EMPTY fact set (the archive was missing that child's log).
+    e('subagent/catalog', 1, { childId: 'missing-child', mode: 'unknown', version: 0, childCreatedAt: 1793500001000 }),
+    e('turn/end', 2, { turn: 1, reason: { kind: 'completed' } }),
+  ]
+  await assert.rejects(
+    () => restoreParentWithChildren(parentHeader, rows, []),
+    error => {
+      // The official chain's own refusal maps to CHILD_EVIDENCE_INCOMPLETE.
+      assert.ok(
+        /subagent\/catalog requires a supported versioned catalog fact/.test(error.message)
+          || error.code === LEGACY_CODES.CHILD_EVIDENCE_INCOMPLETE
+          || error.name === 'SessionFormatUnsupportedMigrationError',
+        `unexpected error: ${error.message.slice(0, 120)}`,
+      )
+      return true
+    },
+  )
+})
+
+test('CHILD_EVIDENCE: parent rows + matching fact restore to v4; unrelated fact set refuses', async () => {
+  if (skip) return
+  const { restoreArtifact, childFactsFromArtifacts, restoreParentWithChildren, encodeCanonicalV4AndSelfCheck } = await loadChain()
+  const req = createRequire(join(rc4Dir, 'noop.js'))
+  const cat = await import(pathToFileURL(req.resolve('@deepseek-ai/dsh-session-format-catalog')).href)
+  const e = (type, seq, data, extra = {}) => ({ type, seq, time: seq + 100, data, ...extra })
+
+  // Build a real subagent child artifact (origin subagent) whose rows carry
+  // a subagent/descriptor event.
+  const childHeader = { type: 'session', version: 3, id: 'child-with-desc', createdAt: 1793500001000, cwd: '/w', isSeeded: false, delegationDepth: 1, origin: 'subagent', parentSession: 'p-match' }
+  const childRestore = cat.historicalSessionFormatCatalog.createRestore(childHeader, { recovery: 'strict', validation: 'current' })
+  const childRows = [
+    e('turn/start', 0, { turn: 1 }),
+    e('subagent/descriptor', 1, { provider: 'test-provider', version: 1, mode: 'continuable', label: 'test child' }),
+    e('turn/end', 2, { turn: 1, reason: { kind: 'completed' } }),
+  ]
+  for (const row of childRows) childRestore.decodeRow(row)
+  const childArtifact = childRestore.finish()
+
+  const facts = await childFactsFromArtifacts([childArtifact])
+  assert.equal(facts[0].childId, 'child-with-desc')
+
+  const parentHeader = { type: 'session', version: 3, id: 'p-match', createdAt: 1, cwd: '/w', isSeeded: false, delegationDepth: 0 }
+  const parentRows = [
+    e('turn/start', 0, { turn: 1 }),
+    e('subagent/catalog', 1, { childId: 'child-with-desc', mode: 'continuable', version: 1, provider: 'test-provider', label: 'test child', childCreatedAt: 1793500001000 }),
+    e('turn/end', 2, { turn: 1, reason: { kind: 'completed' } }),
+  ]
+
+  // Positive: matching fact bound → restores to v4.
+  const parent = await restoreParentWithChildren(parentHeader, parentRows, facts)
+  const canonical = await encodeCanonicalV4AndSelfCheck(parent.artifact)
+  assert.equal(canonical.headerRow.version, 4)
+
+  // Semantics note (probed on rc.4): binding a fact for a DIFFERENT child id
+  // is TOLERATED by the official chain — the parent's own subagent/catalog
+  // rows are authoritative, extra candidate facts are inert. The hard gate
+  // is a declared child with NO fact at all (previous test).
+  const tolerated = await restoreParentWithChildren(parentHeader, parentRows, [{ ...facts[0], childId: 'other-child' }])
+  const canonicalOther = await encodeCanonicalV4AndSelfCheck(tolerated.artifact)
+  assert.equal(canonicalOther.headerRow.version, 4)
+})
