@@ -166,29 +166,152 @@ test('P2 plan: frozen versions are immutable — replacing a different approved 
   }
 })
 
-test('P2 journal: the approved plan digest is bound and enforced at IMPORTING', async () => {
+test('P2 journal: approved-plan gate verifies the ACTUAL plan content, binding and set', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'plan-bind-'))
   try {
     const { computeSnapshotDigest } = await import('../lib/import/g6.js')
     const file = join(dir, 'j.json')
+    const planFile = join(dir, 'plan.json')
     const binding = { instanceFingerprint: 'inst-p', sourceDigest: 'src-p' }
     const snap = { workspaces: [], workspaceIds: [], archivedSessionIds: [], pinnedSessionIds: [], sessions: { a: { exists: false } }, ownership: { plannedCreates: [{ id: 'a', preExisting: false }] } }
     snap.digest = computeSnapshotDigest(snap)
-    const plan = buildPlan({ sourceDigest: 'src-p', instanceFingerprint: 'inst-p', report: { sessions: [{ id: 'a', importable: true }], counts: {} } })
+    const report = { sessions: [{ id: 'a', importable: true }], counts: {} }
+    const planA = buildPlan({ sourceDigest: 'src-p', instanceFingerprint: 'inst-p', report })
+    freezePlan(planFile, planA)
     const j = ImportJournal.init(file, binding, { requirePlanApproval: true })
     j.transitionBatch('PLANNED')
     j.setSnapshot(snap)
     j.transitionBatch('SNAPSHOT_READY')
-    assert.throws(() => j.transitionBatch('IMPORTING'), err => err.code === 'JOURNAL_PLAN_MISMATCH', 'IMPORTING requires the approved plan digest')
-    j.approvePlan({ digest: plan.digest })
-    assert.throws(() => j.assertApprovedPlan({ digest: 'f'.repeat(64) }), err => err.code === 'JOURNAL_PLAN_MISMATCH')
-    j.assertApprovedPlan(plan)
-    j.transitionBatch('IMPORTING')
-    // the binding survives a reload
+
+    // raw transition refuses in approval mode; there is no content check
+    assert.throws(() => j.transitionBatch('IMPORTING'), err => err.code === 'JOURNAL_PLAN_MISMATCH')
+    // no approval bound yet
+    assert.throws(() => j.beginImport(planA), err => err.code === 'JOURNAL_PLAN_MISMATCH')
+    j.approvePlan({ digest: planA.digest, file: planFile })
+
+    // (a) altered IN-MEMORY content carrying the old digest is refused
+    const tampered = JSON.parse(JSON.stringify(planA))
+    tampered.cwdMapping = { '/x': '/y' }
+    assert.throws(() => j.beginImport(tampered), err => err.code === 'PLAN_CORRUPT')
+    // (b) consistent plan passes and records the importing version
+    const started = j.beginImport(planA)
+    assert.equal(started.digest, planA.digest)
+    assert.equal(j.state.importingPlan.digest, planA.digest)
+
+    // (c) a DIFFERENT (explicitly superseded) plan file replacing the bound
+    // one after approval is caught even when the caller passes the old object
+    const planB = buildPlan({ sourceDigest: 'src-p', instanceFingerprint: 'inst-p', report, cwdMapping: { '/x': '/y' } })
+    freezePlan(planFile, planB, { supersedes: planA.digest })
+    const j2 = ImportJournal.init(join(dir, 'j2.json'), binding, { requirePlanApproval: true })
+    j2.transitionBatch('PLANNED')
+    j2.setSnapshot(snap)
+    j2.transitionBatch('SNAPSHOT_READY')
+    j2.approvePlan({ digest: planA.digest, file: planFile })
+    assert.throws(() => j2.beginImport(planA), err => err.code === 'JOURNAL_PLAN_MISMATCH')
+    // (d) plan with a different source/target binding is refused
+    const foreignPlan = buildPlan({ sourceDigest: 'other-src', instanceFingerprint: 'inst-p', report })
+    const j3 = ImportJournal.init(join(dir, 'j3.json'), binding, { requirePlanApproval: true })
+    j3.transitionBatch('PLANNED')
+    j3.setSnapshot(snap)
+    j3.transitionBatch('SNAPSHOT_READY')
+    j3.approvePlan({ digest: foreignPlan.digest })
+    assert.throws(() => j3.beginImport(foreignPlan), err => err.code === 'JOURNAL_PLAN_BINDING')
+    // (e) selected set must match the persisted plan
+    freezePlan(planFile, planA, { supersedes: planB.digest })
+    const emptyPlan = buildPlan({ sourceDigest: 'src-p', instanceFingerprint: 'inst-p', report, selectedIds: [] })
+    const j4 = ImportJournal.init(join(dir, 'j4.json'), binding, { requirePlanApproval: true })
+    j4.transitionBatch('PLANNED')
+    j4.setSnapshot(snap)
+    j4.transitionBatch('SNAPSHOT_READY')
+    j4.approvePlan({ digest: emptyPlan.digest })
+    assert.throws(() => j4.beginImport(emptyPlan), err => err.code === 'JOURNAL_PLAN_BINDING')
+    // (f) reload: recovery check + the same approved version still verifies
     const reloaded = ImportJournal.load(file, binding)
     reloaded.acknowledgeRecovery()
-    reloaded.assertApprovedPlan(plan)
+    reloaded.assertApprovedPlan(planA)
   } finally {
     rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('P2 lock: two CROSS-PROCESS reclaimers cannot interleave — a newer generation survives intact', async () => {
+  const { spawn } = await import('node:child_process')
+  const { writeFileSync: writeFile, existsSync: exists } = await import('node:fs')
+  const { pathToFileURL: p2u } = await import('node:url')
+  const dir = mkdtempSync(join(tmpdir(), 'lock-race-'))
+  const signalDir = mkdtempSync(join(tmpdir(), 'lock-sig-'))
+  const signalFile = join(signalDir, 'a-inside')
+  const goFile = join(signalDir, 'go')
+  const libUrl = p2u(join(import.meta.dirname, '..', 'lib', 'import', 'lock.js')).href
+  const run = (script, args) => new Promise(resolve => {
+    const cp = spawn(process.execPath, ['--input-type=module', '-e', script, ...args], { stdio: ['ignore', 'pipe', 'pipe'] })
+    let out = ''
+    let err = ''
+    cp.stdout.on('data', d => { out += d })
+    cp.stderr.on('data', d => { err += d })
+    cp.on('close', code => resolve({ code, out, err }))
+  })
+  const waitFor = async (file, ms = 10_000) => {
+    const start = Date.now()
+    while (!exists(file)) {
+      if (Date.now() - start > ms) throw new Error(`timed out waiting for ${file}`)
+      await new Promise(r => setTimeout(r, 20))
+    }
+  }
+  try {
+    // A crashed owner left generation G1 behind.
+    writeFile(join(dir, 'import-job.lock'), JSON.stringify({
+      instanceFingerprint: 'inst-race', ownerId: 'dead-owner', generation: 'G1', pid: 999999, at: new Date(0).toISOString(),
+    }))
+    const reclaimerA = run(`
+      const { breakStaleLock } = await import(${JSON.stringify(libUrl)});
+      const fs = await import('node:fs');
+      const [dir, signal, go] = process.argv.slice(1);
+      const res = breakStaleLock(dir, { instanceFingerprint: 'inst-race', olderThanMs: 0, hooks: {
+        beforeUnlink() {
+          fs.writeFileSync(signal, '1');
+          const t0 = Date.now();
+          while (!fs.existsSync(go)) {
+            if (Date.now() - t0 > 8000) throw new Error('hook timeout');
+            Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+          }
+        },
+      } });
+      process.stdout.write(JSON.stringify(res));
+    `, [dir, signalFile, goFile])
+    await waitFor(signalFile)
+    // Reclaimer B starts while A is paused INSIDE the guard: it must block.
+    const reclaimerB = run(`
+      const { breakStaleLock } = await import(${JSON.stringify(libUrl)});
+      const [dir] = process.argv.slice(1);
+      const res = breakStaleLock(dir, { instanceFingerprint: 'inst-race', olderThanMs: 0 });
+      process.stdout.write(JSON.stringify(res));
+    `, [dir])
+    await new Promise(r => setTimeout(r, 300))
+    writeFile(goFile, '1')
+    const [a, b] = await Promise.all([reclaimerA, reclaimerB])
+    assert.equal(a.code, 0, `A stderr: ${a.err.slice(0, 300)}`)
+    assert.equal(b.code, 0, `B stderr: ${b.err.slice(0, 300)}`)
+    const resA = JSON.parse(a.out)
+    const resB = JSON.parse(b.out)
+    assert.equal(resA.broken, true, 'the first reclaimer removes the stale G1')
+    assert.equal(resB.broken, false, 'the second reclaimer must observe the serialized state, not delete a newer lock')
+    // a new holder now acquires; no stale reclaimer may remove it
+    const current = acquireJobLock(dir, { instanceFingerprint: 'inst-race' })
+    assert.equal(peekJobLock(dir).held, true)
+    const third = run(`
+      const { acquireJobLock } = await import(${JSON.stringify(libUrl)});
+      const [dir] = process.argv.slice(1);
+      try { const l = acquireJobLock(dir, { instanceFingerprint: 'inst-race' }); l.release(); process.stdout.write(JSON.stringify({ acquired: true })); }
+      catch (e) { process.stdout.write(JSON.stringify({ acquired: false, code: e.code })); }
+    `, [dir])
+    const resThird = JSON.parse((await third).out)
+    assert.equal(resThird.acquired, false, 'a third job must be refused while the new generation is unreleased')
+    assert.equal(resThird.code, 'IMPORT_JOB_LOCKED')
+    assert.equal(peekJobLock(dir).held, true, 'the new generation lock is still present')
+    current.release()
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+    rmSync(signalDir, { recursive: true, force: true })
   }
 })
