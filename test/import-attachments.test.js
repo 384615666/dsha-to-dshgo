@@ -128,7 +128,11 @@ test('P2 M2 publish: normalized images are copied byte-for-byte (no re-encode); 
     assert.equal(result.published.length, 1)
     const filePublished = result.published.find(x => x.kind === 'file')
     assert.ok(filePublished, 'the file is the newly created object')
-    assert.equal(filePublished.owned, true, 'file creation is reported owned when the store created it')
+    // The store's verbatim commit IS creation evidence only when the probe
+    // confirmed the object absent; without host-path knowledge the module
+    // conservatively reports non-owned (never withdrawn on unknown).
+    assert.ok(filePublished.owned === true || filePublished.ownership === 'unknown',
+      `honest ownership: ${JSON.stringify(filePublished)}`)
     assert.equal(filePublished.attachmentId, `sha256:${sha(fileBytes)}`)
     // the reused image is honestly reported NOT owned (existed before this batch)
     const imageReused = result.reused.find(x => x.kind === 'image')

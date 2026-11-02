@@ -333,3 +333,78 @@ test('P2 M3 cancel: a pre-aborted run compensates at the safe boundary and repor
     rmSync(jobDir, { recursive: true, force: true })
   }
 })
+
+test('P2 R1 regression: metadata id != header.id refuses BEFORE any write; DONE rerun with a missing session demands recovery', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
+  const t = await mountEngine()
+  const jobDir = mkdtempSync(join(tmpdir(), 'm3-r1-'))
+  try {
+    const wdir = join(t.base, 'w')
+    mkdirSync(wdir, { recursive: true })
+    // candidate identity mismatch
+    const mismatched = await candidate('unapproved-header-id', wdir, { withWorkspace: false })
+    const approvedPlan = {
+      digest: '0'.repeat(64),
+      sourceDigest: 'src-m3',
+      target: { instanceFingerprint: 'inst-m3' },
+      selected: ['approved-metadata-id'],
+      excluded: [],
+      sessions: [],
+    }
+    const journal = ImportJournal.init(join(jobDir, 'journal.json'), { instanceFingerprint: 'inst-m3', sourceDigest: 'src-m3' }, { requirePlanApproval: true })
+    journal.transitionBatch('PLANNED')
+    const before = await t.persistence.stat('unapproved-header-id')
+    const result = await runImportJob({
+      jobDir,
+      instanceLockDir: join(jobDir, 'lock'),
+      instanceFingerprint: 'inst-m3',
+      sourceDigest: 'src-m3',
+      approvedPlan,
+      target: t,
+      sessions: [{ ...mismatched, id: 'approved-metadata-id' }],
+      withdrawSession: async () => { throw new Error('no writes must happen') },
+      allowUnprotected: true,
+    })
+    assert.match(String(result.error?.message), /identity mismatch/)
+    assert.equal(await t.persistence.stat('unapproved-header-id'), before, 'nothing was written for the mismatched candidate')
+
+    // DONE rerun with a REMOVED session: the persisted plan set re-checks
+    const s1 = await candidate('m3-done', wdir, { withWorkspace: false })
+    const good = buildPlan({ sourceDigest: 'src-m3', instanceFingerprint: 'inst-m3', report: { sessions: [{ id: 'm3-done', importable: true }], counts: {} } })
+    freezePlan(join(jobDir, 'plan-good.json'), good)
+    const j2 = ImportJournal.init(join(jobDir, 'run2', 'journal.json'), { instanceFingerprint: 'inst-m3', sourceDigest: 'src-m3' }, { requirePlanApproval: true })
+    j2.approvePlan({ digest: good.digest, file: join(jobDir, 'plan-good.json') })
+    j2.transitionBatch('PLANNED')
+    const { importSessionViaA } = await import('../lib/import/writer-a.js')
+    const run1 = await runImportJob({
+      jobDir: join(jobDir, 'run2'),
+      instanceLockDir: join(jobDir, 'lock2'),
+      instanceFingerprint: 'inst-m3',
+      sourceDigest: 'src-m3',
+      approvedPlan: good,
+      target: t,
+      sessions: [s1],
+      withdrawSession: async () => {},
+      allowUnprotected: true,
+    })
+    assert.equal(run1.status, 'DONE', JSON.stringify(run1.error ?? run1.verification ?? run1))
+    // remove the imported session's directory (simulated target loss)
+    const dir = t.locateDir(s1.header)
+    rmSync(join(t.sessionsRoot, dir), { recursive: true, force: true })
+    const run2 = await runImportJob({
+      jobDir: join(jobDir, 'run2'),
+      instanceLockDir: join(jobDir, 'lock2'),
+      instanceFingerprint: 'inst-m3',
+      sourceDigest: 'src-m3',
+      approvedPlan: good,
+      target: t,
+      sessions: [s1],
+      withdrawSession: async () => {},
+      allowUnprotected: true,
+    })
+    assert.equal(run2.status, 'RECOVERY_REQUIRED', `a missing committed session must demand recovery (got ${run2.status})`)
+    assert.equal(run2.recovery?.classification, 'absent')
+  } finally {
+    await t.unmount()
+    rmSync(jobDir, { recursive: true, force: true })
+  }
+})
