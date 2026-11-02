@@ -138,13 +138,20 @@ test('F5: invalid UTF-8 and truncated skippable tails refuse; budgets bound DURI
   const bigFrame = zlib.zstdCompressSync(Buffer.from('x'.repeat(4096)))
   assert.throws(
     () => decompressZstdMultiFrame(bigFrame, { maxBytes: 16 }),
-    err => err.message.includes('native output limit applied before allocation') && /budget/.test(err.message),
+    err => err.code === 'SESSION_BUDGET' && err.message.includes('native output limit applied before allocation'),
     'single-frame output must be capped natively, not allocated then refused',
   )
   // 6) budget 0 refuses before any decode; exact-fit output passes.
   assert.throws(
     () => decompressZstdMultiFrame(bigFrame, { maxBytes: 0 }),
-    err => /budget/.test(err.message),
+    err => err.code === 'SESSION_BUDGET' && /budget/.test(err.message),
+  )
+  // 6b) cumulative budget across frames: second frame rejected natively with
+  // the SAME stable code (first frame consumed 8 of 12).
+  const f8 = zlib.zstdCompressSync(Buffer.from('x'.repeat(8)))
+  assert.throws(
+    () => decompressZstdMultiFrame(Buffer.concat([f8, f8]), { maxBytes: 12 }),
+    err => err.code === 'SESSION_BUDGET' && err.message.includes('at frame 2'),
   )
   const exact = decompressZstdMultiFrame(zlib.zstdCompressSync(Buffer.from('y'.repeat(16))), { maxBytes: 16 })
   assert.equal(exact.length, 16, 'output exactly at budget is admitted')
