@@ -14,6 +14,7 @@ import { runImportJob } from '../lib/import/job.js'
 import { buildPlan, freezePlan } from '../lib/import/plan.js'
 import { ImportJournal } from '../lib/import/journal.js'
 import { createJsonlWithdrawalAdapter } from '../lib/import/withdraw.js'
+import { readWorkspaceRegistryView } from '../lib/import/g6.js'
 import { planAttachmentPublication, publishAttachments } from '../lib/import/attachments.js'
 
 const rc4Dir = process.env.RC4_MODULES
@@ -445,6 +446,7 @@ test('P2 F1/F2/F3: late-present corrupt file refuses with no dangling intent; us
     assert.equal(action.stage, 'done', 'the late-present reuse path must confirm its intent')
     assert.equal(action.outcome.ownership, 'rejected', 'the CORRUPT late object is refused, not claimed as reused')
   } finally {
+    await t.unmount()
     rmSync(jobDir, { recursive: true, force: true })
   }
 
@@ -468,10 +470,32 @@ test('P2 F1/F2/F3: late-present corrupt file refuses with no dangling intent; us
       locateDir: h => t2.locateDir(h),
       quarantineRoot: join(jobDir2, 'quarantine'),
     })
-    // fail the workspace attach AFTER the session import (ghost path)
-    const ghost = { ...s1, workspace: { path: join(t2.base, 'no-such-dir'), title: 'x' } }
+    // F2 real interleaving: the import SUCCEEDS through attach; a wrapped
+    // protected withdrawal (same protected flag, all params forwarded) then
+    // lets an INDEPENDENT user rename happen BETWEEN the action layer's
+    // verification and the workspace recovery — deterministic via an async
+    // stat await in the wrapper.
+    const ghost = { ...s1, workspace: { path: wdir, title: 'original-title' } }
+    const injection = { done: false }
     const controller = new AbortController()
-    controller.abort()
+    // The cancel arrives right AFTER the batch attaches the session (attach
+    // 后取消): the pre-existing workspace W is found by path, so wrap its
+    // attachSession to abort the signal at that deterministic point; attach
+    // itself still succeeds.
+    const realAttach = W.attachSession.bind(W)
+    W.attachSession = async sessionId => {
+      await realAttach(sessionId)
+      controller.abort()
+    }
+    const wrappedWithdraw = Object.assign(async (id, opts) => {
+      // run the protected adapter first (attaches happened; withdrawal ok)
+      await withdraw(id, opts)
+      // inject the user rename BETWEEN layers: the action layer has finished
+      // its verification (which reads workspace state), the workspace
+      // recovery has not started. Await it fully — a real user op completes.
+      await W.setTitle('independent-user-title')
+      injection.done = true
+    }, { protected: withdraw.protected })
     const result = await runImportJob({
       jobDir: jobDir2,
       instanceLockDir: join(jobDir2, 'lock'),
@@ -480,16 +504,33 @@ test('P2 F1/F2/F3: late-present corrupt file refuses with no dangling intent; us
       approvedPlan: good,
       target: t2,
       sessions: [ghost],
-      withdrawSession: withdraw,
+      withdrawSession: wrappedWithdraw,
       signal: controller.signal,
       allowUnprotected: true,
     })
-    assert.ok(['CANCELLED', 'CANCELLED_ROLLBACK_PENDING'].includes(result.status), JSON.stringify(result))
-    // status and persisted verdict must agree
+    assert.ok(injection.done, 'the between-layers user rename must have been injected')
+    // the user title is PRESERVED (never overwritten)
+    const nowView = readWorkspaceRegistryView(t2.workspaceRegistry)
+    const nowW = nowView.workspaces.find(w => w.path === wdir)
+    assert.equal(nowW?.title, 'independent-user-title', 'the user rename must survive the rollback')
+    // AGGREGATED verdict: workspace pending → CANCELLED_ROLLBACK_PENDING
+    assert.equal(result.status, 'CANCELLED_ROLLBACK_PENDING', `aggregated: ${JSON.stringify(result.rollback)}`)
+    assert.equal(result.rollback.outcome, 'pending')
+    // The workspace layer honestly reports pending because the user rename
+    // is preserved (gaps=1 is the recorded createdAt capability gap).
+    assert.equal(result.rollback.workspaceOutcome, 'pending', 'the workspace layer is pending')
+    assert.ok(result.rollback.finalVerification, 'the final verification exists')
+    // persisted terminal agrees with the return
     const reloaded = ImportJournal.load(join(jobDir2, 'journal.json'), { instanceFingerprint: 'inst-f2', sourceDigest: 'src-f2' })
-    assert.equal(reloaded.state.rollback?.outcome, result.status === 'CANCELLED' ? 'complete' : 'pending', 'status and persisted verdict must agree')
-    if (result.status === 'CANCELLED') assert.equal(reloaded.state.batchState, 'ROLLED_BACK')
-    else assert.equal(reloaded.state.batchState, 'ROLLBACK_PENDING')
+    assert.equal(reloaded.state.batchState, 'ROLLBACK_PENDING')
+    assert.equal(reloaded.state.rollback?.outcome, 'pending')
+    // The action layer outcome here reflects THIS rollback pass: the attach
+    // threw AbortError right after itself, so the pass recorded the abort as
+    // its failure; the workspace layer honestly reports pending because the
+    // user rename is preserved. What matters: the persisted verdict is
+    // AGGREGATE pending and matches the returned status — no split.
+    assert.equal(reloaded.state.rollback?.workspaceOutcome, 'pending')
+    assert.equal(reloaded.state.rollback?.verification?.ok, false)
   } finally {
     await t2.unmount()
     rmSync(jobDir2, { recursive: true, force: true })
