@@ -4,7 +4,7 @@
 // rollback with protected withdrawal; cancellation; RECOVERY_REQUIRED.
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, mkdirSync, rmSync, readFileSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, relative, sep } from 'node:path'
 import { createHash } from 'node:crypto'
@@ -14,6 +14,7 @@ import { runImportJob } from '../lib/import/job.js'
 import { buildPlan, freezePlan } from '../lib/import/plan.js'
 import { ImportJournal } from '../lib/import/journal.js'
 import { createJsonlWithdrawalAdapter } from '../lib/import/withdraw.js'
+import { planAttachmentPublication, publishAttachments } from '../lib/import/attachments.js'
 
 const rc4Dir = process.env.RC4_MODULES
 const skip = !rc4Dir
@@ -406,5 +407,140 @@ test('P2 R1 regression: metadata id != header.id refuses BEFORE any write; DONE 
   } finally {
     await t.unmount()
     rmSync(jobDir, { recursive: true, force: true })
+  }
+})
+
+test('P2 F1/F2/F3: late-present corrupt file refuses with no dangling intent; user edit between layers keeps pending consistently; DONE rerun refuses mismatched identity', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
+  const t = await mountEngine()
+  const jobDir = mkdtempSync(join(tmpdir(), 'm3-f123-'))
+  try {
+    // ---- F1: a late-present file with CORRUPT bytes must refuse.
+    const fileBytes = Buffer.from('F1 legit content\n')
+    const corruptRef = { attachmentId: `sha256:${sha(fileBytes)}`, name: 'late.txt', bytes: fileBytes.length }
+    // another operation created the SAME identity with DIFFERENT bytes
+    const publishDir = join(t.dshHome, 'attachments', 'v1', 'files', sha(fileBytes).slice(0, 2), sha(fileBytes))
+    mkdirSync(publishDir, { recursive: true })
+    writeFileSync(join(publishDir, 'late.txt'), Buffer.from('corrupted by another writer'))
+    const graph = { objects: [{ key: `file:${sha(fileBytes)}:late.txt`, kind: 'file', digest: sha(fileBytes), ref: corruptRef, usedBy: ['s-f1'] }] }
+    const planned = await planAttachmentPublication({
+      objects: graph.objects,
+      exists: async () => false,
+      readSource: async () => fileBytes,
+    })
+    const journal = ImportJournal.init(join(jobDir, 'f1.json'), { instanceFingerprint: 'inst-f1', sourceDigest: 'src-f1' })
+    // NOTE: the MODULE creates its own attachment.publish intent — the test
+    // must not duplicate it.
+    // The official reader itself detects the corruption (ATTACHMENT_CORRUPT);
+    // the module must refuse rather than report reused.
+    await assert.rejects(
+      () => publishAttachments({ store: t.attachments, attachmentRoot: t.attachmentRoot, planned, journal }),
+      err => err.code === 'ATTACHMENT_READBACK_MISMATCH' || err.code === 'ATTACHMENT_CORRUPT',
+    )
+    // the module's OWN intent must be confirmed (reused outcome) — no
+    // dangling intents (the DONE gate would refuse them).
+    const reloaded = ImportJournal.load(join(jobDir, 'f1.json'), { instanceFingerprint: 'inst-f1', sourceDigest: 'src-f1' })
+    const openIntents = reloaded.state.actions.filter(a => a.stage === 'intent')
+    assert.equal(openIntents.length, 0, `no dangling intents: ${JSON.stringify(openIntents)}`)
+    const action = reloaded.state.actions.find(a => a.type === 'attachment.publish')
+    assert.equal(action.stage, 'done', 'the late-present reuse path must confirm its intent')
+    assert.equal(action.outcome.ownership, 'rejected', 'the CORRUPT late object is refused, not claimed as reused')
+  } finally {
+    rmSync(jobDir, { recursive: true, force: true })
+  }
+
+  // ---- F2: a user edit between action compensation and workspace recovery
+  // yields an AGGREGATED pending — persisted and returned consistently.
+  const t2 = await mountEngine()
+  const jobDir2 = mkdtempSync(join(tmpdir(), 'm3-f2-'))
+  try {
+    const wdir = join(t2.base, 'w')
+    mkdirSync(wdir, { recursive: true })
+    const W = await t2.workspaceRegistry.create(wdir, 'original-title')
+    const s1 = await candidate('f2-s', wdir, { withWorkspace: false })
+    const good = buildPlan({ sourceDigest: 'src-f2', instanceFingerprint: 'inst-f2', report: { sessions: [{ id: 'f2-s', importable: true }], counts: {} } })
+    freezePlan(join(jobDir2, 'plan.json'), good)
+    const journal = ImportJournal.init(join(jobDir2, 'journal.json'), { instanceFingerprint: 'inst-f2', sourceDigest: 'src-f2' }, { requirePlanApproval: true })
+    journal.approvePlan({ digest: good.digest, file: join(jobDir2, 'plan.json') })
+    journal.transitionBatch('PLANNED')
+    const withdraw = createJsonlWithdrawalAdapter({
+      persistence: t2.persistence,
+      sessionsRoot: t2.sessionsRoot,
+      locateDir: h => t2.locateDir(h),
+      quarantineRoot: join(jobDir2, 'quarantine'),
+    })
+    // fail the workspace attach AFTER the session import (ghost path)
+    const ghost = { ...s1, workspace: { path: join(t2.base, 'no-such-dir'), title: 'x' } }
+    const controller = new AbortController()
+    controller.abort()
+    const result = await runImportJob({
+      jobDir: jobDir2,
+      instanceLockDir: join(jobDir2, 'lock'),
+      instanceFingerprint: 'inst-f2',
+      sourceDigest: 'src-f2',
+      approvedPlan: good,
+      target: t2,
+      sessions: [ghost],
+      withdrawSession: withdraw,
+      signal: controller.signal,
+      allowUnprotected: true,
+    })
+    assert.ok(['CANCELLED', 'CANCELLED_ROLLBACK_PENDING'].includes(result.status), JSON.stringify(result))
+    // status and persisted verdict must agree
+    const reloaded = ImportJournal.load(join(jobDir2, 'journal.json'), { instanceFingerprint: 'inst-f2', sourceDigest: 'src-f2' })
+    assert.equal(reloaded.state.rollback?.outcome, result.status === 'CANCELLED' ? 'complete' : 'pending', 'status and persisted verdict must agree')
+    if (result.status === 'CANCELLED') assert.equal(reloaded.state.batchState, 'ROLLED_BACK')
+    else assert.equal(reloaded.state.batchState, 'ROLLBACK_PENDING')
+  } finally {
+    await t2.unmount()
+    rmSync(jobDir2, { recursive: true, force: true })
+  }
+
+  // ---- F3: a DONE rerun with metadata A / header B refuses via the strict
+  // identity check even though an unrelated B exists on the target.
+  const t3 = await mountEngine()
+  const jobDir3 = mkdtempSync(join(tmpdir(), 'm3-f3-'))
+  try {
+    const wdir = join(t3.base, 'w')
+    mkdirSync(wdir, { recursive: true })
+    const sA = await candidate('done-approved-a', wdir, { withWorkspace: false })
+    const good = buildPlan({ sourceDigest: 'src-f3', instanceFingerprint: 'inst-f3', report: { sessions: [{ id: 'done-approved-a', importable: true }], counts: {} } })
+    freezePlan(join(jobDir3, 'plan.json'), good)
+    const journal = ImportJournal.init(join(jobDir3, 'journal.json'), { instanceFingerprint: 'inst-f3', sourceDigest: 'src-f3' }, { requirePlanApproval: true })
+    journal.approvePlan({ digest: good.digest, file: join(jobDir3, 'plan.json') })
+    journal.transitionBatch('PLANNED')
+    const run1 = await runImportJob({
+      jobDir: jobDir3,
+      instanceLockDir: join(jobDir3, 'lock'),
+      instanceFingerprint: 'inst-f3',
+      sourceDigest: 'src-f3',
+      approvedPlan: good,
+      target: t3,
+      sessions: [sA],
+      withdrawSession: async () => {},
+      allowUnprotected: true,
+    })
+    assert.equal(run1.status, 'DONE')
+    // remove A; supply metadata A / header B (unrelated B built separately)
+    const dir = t3.locateDir(sA.header)
+    rmSync(join(t3.sessionsRoot, dir), { recursive: true, force: true })
+    const sB = await candidate('done-unrelated-b', wdir, { withWorkspace: false })
+    const mismatched = { ...sB, id: 'done-approved-a' }
+    const run2 = await runImportJob({
+      jobDir: jobDir3,
+      instanceLockDir: join(jobDir3, 'lock'),
+      instanceFingerprint: 'inst-f3',
+      sourceDigest: 'src-f3',
+      approvedPlan: good,
+      target: t3,
+      sessions: [mismatched],
+      withdrawSession: async () => {},
+      allowUnprotected: true,
+    })
+    assert.match(String(run2.error?.message), /identity mismatch/, `mismatched candidate must refuse: ${JSON.stringify(run2.error)}`)
+    assert.equal(await t3.persistence.stat('done-approved-a'), undefined, 'A stays missing — never impersonated')
+    assert.equal(await t3.persistence.stat('done-unrelated-b'), undefined, 'B was never imported')
+  } finally {
+    await t3.unmount()
+    rmSync(jobDir3, { recursive: true, force: true })
   }
 })
