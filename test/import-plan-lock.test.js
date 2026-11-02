@@ -1,7 +1,7 @@
 // P2 batch-3 basics: immutable plan.json + per-instance job lock.
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync, readFileSync, writeFileSync, existsSync, readdirSync } from 'node:fs'
+import { mkdtempSync, rmSync, readFileSync, writeFileSync, existsSync, readdirSync, mkdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { buildPlan, freezePlan, loadPlan, verifyPlanFresh } from '../lib/import/plan.js'
@@ -69,11 +69,13 @@ test('P2 lock: one job per target instance; release; explicit stale break only',
     assert.throws(() => acquireJobLock(dir, { instanceFingerprint: 'inst-1' }), err => err.code === 'IMPORT_JOB_LOCKED' && err.holder?.pid === process.pid)
     assert.throws(() => acquireJobLock(dir, { instanceFingerprint: 'inst-2' }), err => err.code === 'IMPORT_JOB_LOCKED')
     // breaking a different instance's lock is refused
-    assert.throws(() => breakStaleLock(dir, { instanceFingerprint: 'inst-2' }), err => err.code === 'IMPORT_JOB_LOCKED')
+    const observed = peekJobLock(dir)
+    const expect = { ownerId: observed.holder.ownerId, generation: observed.holder.generation }
+    assert.throws(() => breakStaleLock(dir, { instanceFingerprint: 'inst-2', expect }), err => err.code === 'IMPORT_JOB_LOCKED')
     // a fresh lock is not breakable with a threshold
-    assert.throws(() => breakStaleLock(dir, { instanceFingerprint: 'inst-1', olderThanMs: 60_000 }), err => err.code === 'IMPORT_JOB_LOCKED')
+    assert.throws(() => breakStaleLock(dir, { instanceFingerprint: 'inst-1', olderThanMs: 60_000, expect }), err => err.code === 'IMPORT_JOB_LOCKED')
     // explicit break (caller judged the journal) then re-acquire
-    const broken = breakStaleLock(dir, { instanceFingerprint: 'inst-1', olderThanMs: 0 })
+    const broken = breakStaleLock(dir, { instanceFingerprint: 'inst-1', olderThanMs: 0, expect })
     assert.equal(broken.broken, true)
     assert.equal(existsSync(lock.file), false)
     const again = acquireJobLock(dir, { instanceFingerprint: 'inst-1' })
@@ -98,7 +100,9 @@ test('P2 F2: the lock is INSTANCE-level — two different job directories of one
 
     // Generation identity: after an explicit stale break, the OLD handle must
     // not delete the NEW generation's lock.
-    const broken = breakStaleLock(shared, { instanceFingerprint: 'inst-1', olderThanMs: 0 })
+    const beforeBreak = peekJobLock(shared)
+    const expectG1 = { ownerId: beforeBreak.holder.ownerId, generation: beforeBreak.holder.generation }
+    const broken = breakStaleLock(shared, { instanceFingerprint: 'inst-1', olderThanMs: 0, expect: expectG1 })
     assert.equal(broken.broken, true)
     const current = acquireJobLock(shared, { instanceFingerprint: 'inst-1' })
     assert.notEqual(current.holder.generation, a.holder.generation)
@@ -216,15 +220,37 @@ test('P2 journal: approved-plan gate verifies the ACTUAL plan content, binding a
     j3.transitionBatch('SNAPSHOT_READY')
     j3.approvePlan({ digest: foreignPlan.digest })
     assert.throws(() => j3.beginImport(foreignPlan), err => err.code === 'JOURNAL_PLAN_BINDING')
-    // (e) selected set must match the persisted plan
+    // (e) EMPTY plannedCreates must NOT be a free pass: a plan selecting A
+    // against a snapshot with no planned creates is refused.
     freezePlan(planFile, planA, { supersedes: planB.digest })
+    const emptySnap = { workspaces: [], workspaceIds: [], archivedSessionIds: [], pinnedSessionIds: [], sessions: {}, ownership: { plannedCreates: [] } }
+    emptySnap.digest = computeSnapshotDigest(emptySnap)
+    const j5 = ImportJournal.init(join(dir, 'j5.json'), binding, { requirePlanApproval: true })
+    j5.transitionBatch('PLANNED')
+    j5.setSnapshot(emptySnap)
+    j5.transitionBatch('SNAPSHOT_READY')
+    j5.approvePlan({ digest: planA.digest, file: planFile })
+    assert.throws(() => j5.beginImport(planA), err => err.code === 'JOURNAL_PLAN_BINDING')
+    // structurally missing ownership is refused too
+    const noOwnership = { workspaces: [], workspaceIds: [], archivedSessionIds: [], pinnedSessionIds: [], sessions: {} }
+    noOwnership.digest = computeSnapshotDigest(noOwnership)
+    const j6 = ImportJournal.init(join(dir, 'j6.json'), binding, { requirePlanApproval: true })
+    j6.transitionBatch('PLANNED')
+    j6.setSnapshot(noOwnership)
+    j6.transitionBatch('SNAPSHOT_READY')
+    j6.approvePlan({ digest: planA.digest, file: planFile })
+    assert.throws(() => j6.beginImport(planA), err => err.code === 'JOURNAL_PLAN_BINDING')
+    // (e2) an explicitly EMPTY selection resolves as a no-write result and
+    // never enters IMPORTING.
     const emptyPlan = buildPlan({ sourceDigest: 'src-p', instanceFingerprint: 'inst-p', report, selectedIds: [] })
     const j4 = ImportJournal.init(join(dir, 'j4.json'), binding, { requirePlanApproval: true })
     j4.transitionBatch('PLANNED')
     j4.setSnapshot(snap)
     j4.transitionBatch('SNAPSHOT_READY')
     j4.approvePlan({ digest: emptyPlan.digest })
-    assert.throws(() => j4.beginImport(emptyPlan), err => err.code === 'JOURNAL_PLAN_BINDING')
+    const noWrites = j4.beginImport(emptyPlan)
+    assert.equal(noWrites.noWrites, true)
+    assert.equal(j4.state.batchState, 'SNAPSHOT_READY', 'a no-write plan never enters IMPORTING')
     // (f) reload: recovery check + the same approved version still verifies
     const reloaded = ImportJournal.load(file, binding)
     reloaded.acknowledgeRecovery()
@@ -264,10 +290,12 @@ test('P2 lock: two CROSS-PROCESS reclaimers cannot interleave — a newer genera
       instanceFingerprint: 'inst-race', ownerId: 'dead-owner', generation: 'G1', pid: 999999, at: new Date(0).toISOString(),
     }))
     const reclaimerA = run(`
-      const { breakStaleLock } = await import(${JSON.stringify(libUrl)});
+      const { breakStaleLock, peekJobLock } = await import(${JSON.stringify(libUrl)});
       const fs = await import('node:fs');
       const [dir, signal, go] = process.argv.slice(1);
-      const res = breakStaleLock(dir, { instanceFingerprint: 'inst-race', olderThanMs: 0, hooks: {
+      const judged = peekJobLock(dir);
+      const expect = { ownerId: judged.holder.ownerId, generation: judged.holder.generation };
+      const res = breakStaleLock(dir, { instanceFingerprint: 'inst-race', olderThanMs: 0, expect, hooks: {
         beforeUnlink() {
           fs.writeFileSync(signal, '1');
           const t0 = Date.now();
@@ -282,9 +310,11 @@ test('P2 lock: two CROSS-PROCESS reclaimers cannot interleave — a newer genera
     await waitFor(signalFile)
     // Reclaimer B starts while A is paused INSIDE the guard: it must block.
     const reclaimerB = run(`
-      const { breakStaleLock } = await import(${JSON.stringify(libUrl)});
+      const { breakStaleLock, peekJobLock } = await import(${JSON.stringify(libUrl)});
       const [dir] = process.argv.slice(1);
-      const res = breakStaleLock(dir, { instanceFingerprint: 'inst-race', olderThanMs: 0 });
+      const judged = peekJobLock(dir);
+      const expect = { ownerId: judged.holder.ownerId, generation: judged.holder.generation };
+      const res = breakStaleLock(dir, { instanceFingerprint: 'inst-race', olderThanMs: 0, expect });
       process.stdout.write(JSON.stringify(res));
     `, [dir])
     await new Promise(r => setTimeout(r, 300))
@@ -313,5 +343,46 @@ test('P2 lock: two CROSS-PROCESS reclaimers cannot interleave — a newer genera
   } finally {
     rmSync(dir, { recursive: true, force: true })
     rmSync(signalDir, { recursive: true, force: true })
+  }
+})
+
+test('P2 lock: a reclaimer waiting behind the guard never re-targets a NEW generation; release is retryable after guard-busy', async () => {
+  const { utimesSync } = await import('node:fs')
+  const dir = mkdtempSync(join(tmpdir(), 'lock-bind-'))
+  try {
+    // --- generation binding: the recovery judgment targeted G1.
+    writeFileSync(join(dir, 'import-job.lock'), JSON.stringify({
+      instanceFingerprint: 'inst-b', ownerId: 'dead', generation: 'G1', pid: 999999, at: new Date(0).toISOString(),
+    }))
+    const judged = peekJobLock(dir)
+    const expectG1 = { ownerId: judged.holder.ownerId, generation: judged.holder.generation }
+    // While the caller waited, a NEW holder acquired G2.
+    writeFileSync(join(dir, 'import-job.lock'), JSON.stringify({
+      instanceFingerprint: 'inst-b', ownerId: 'live', generation: 'G2', pid: process.pid, at: new Date().toISOString(),
+    }))
+    const late = breakStaleLock(dir, { instanceFingerprint: 'inst-b', olderThanMs: 0, expect: expectG1 })
+    assert.equal(late.broken, false, 'a late reclaimer must never delete the new generation')
+    assert.equal(late.reason, 'generation-mismatch')
+    const stillThere = JSON.parse(readFileSync(join(dir, 'import-job.lock'), 'utf8'))
+    assert.equal(stillThere.generation, 'G2', 'G2 survives the late reclaimer')
+    // expectation is mandatory
+    assert.throws(() => breakStaleLock(dir, { instanceFingerprint: 'inst-b' }), err => err.code === 'IMPORT_LOCK_INVALID')
+
+    // --- release retry: a guard-busy failure must not close the release path.
+    rmSync(join(dir, 'import-job.lock'), { force: true })
+    const lock = acquireJobLock(dir, { instanceFingerprint: 'inst-b' })
+    const guard = join(dir, 'import-job.lock.guard')
+    mkdirSync(guard)
+    const old = new Date(Date.now() - 60_000)
+    utimesSync(guard, old, old)
+    assert.throws(() => lock.release(), err => err.code === 'IMPORT_LOCK_BUSY', 'a stale guard makes release fail loudly')
+    assert.equal(peekJobLock(dir).held, true, 'the failed release did not pretend to release')
+    rmSync(guard, { recursive: true, force: true })
+    lock.release() // retry succeeds
+    assert.equal(peekJobLock(dir).held, false)
+    lock.release() // idempotent
+    assert.equal(peekJobLock(dir).held, false)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
   }
 })
