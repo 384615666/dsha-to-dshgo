@@ -309,27 +309,24 @@ test('v3 parent restore still works when the archive declares no direct children
   assert.equal(canonical.headerRow.id, 'session-solo')
 })
 
-test('CHILD_EVIDENCE: parent rows carry subagent/catalog but no fact bound → official chain refuses', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
+test('CHILD_EVIDENCE: ILLEGAL parent catalog row (version 0/unknown mode) refuses regardless of facts — NOT a missing-fact refusal', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
   const { restoreParentWithChildren, LEGACY_CODES } = await loadChain()
   const e = (type, seq, data, extra = {}) => ({ type, seq, time: seq + 100, data, ...extra })
   const parentHeader = { type: 'session', version: 3, id: 'p-ev', createdAt: 1, cwd: '/w', isSeeded: false, delegationDepth: 0 }
   const rows = [
     e('turn/start', 0, { turn: 1 }),
-    // The parent declares a subagent child in its own rows, but the caller
-    // binds an EMPTY fact set (the archive was missing that child's log).
+    // The refusal source is the ILLEGAL row payload (version 0 / mode
+    // unknown is not a supported catalog fact shape) — renaming the old
+    // "no fact bound → refuses" claim, which the differential matrix
+    // disproved (a LEGAL parent catalog row is self-sufficient with an
+    // empty fact set).
     e('subagent/catalog', 1, { childId: 'missing-child', mode: 'unknown', version: 0, childCreatedAt: 1793500001000 }),
     e('turn/end', 2, { turn: 1, reason: { kind: 'completed' } }),
   ]
   await assert.rejects(
     () => restoreParentWithChildren(parentHeader, rows, []),
     error => {
-      // The official chain's own refusal maps to CHILD_EVIDENCE_INCOMPLETE.
-      assert.ok(
-        /subagent\/catalog requires a supported versioned catalog fact/.test(error.message)
-          || error.code === LEGACY_CODES.CHILD_EVIDENCE_INCOMPLETE
-          || error.name === 'SessionFormatUnsupportedMigrationError',
-        `unexpected error: ${error.message.slice(0, 120)}`,
-      )
+      assert.equal(error.code, LEGACY_CODES.CHILD_EVIDENCE_INCOMPLETE, `expected CHILD_EVIDENCE_INCOMPLETE, got ${error.code} (${error.message.slice(0, 120)})`)
       return true
     },
   )
@@ -421,22 +418,40 @@ test('v1 raw physical rows: shared-layout header + rows decode through the offic
   assert.equal(out.headerRow.id, 'session-synth-v1')
 })
 
-test('R1: one-shot generator input produces the SAME full result as an array (no silent empty session)', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
+test('R1: one-shot generator input produces the SAME full result as an array — on the LEGACY v3 path (both chain passes)', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
+  // The historical path runs TWO passes over the physical rows (historical
+  // catalog, then child-bound). A one-shot generator consumed by pass 1 used
+  // to leave pass 2 an exhausted iterator → official chain accepts the empty
+  // session → silent 5→0 "success". v4 does not exercise both passes, so the
+  // regression must drive a real v3 fixture.
   const { migrateToV4 } = await loadChain()
-  const f = v4Fixture('session-gen')
-  // Array baseline
-  const fromArray = await migrateToV4(f.header, f.rows, { childFacts: null })
-  assert.equal(fromArray.eventRows.length, f.rows.length)
-  // One-shot generator with identical rows: must NOT silently yield an
-  // empty session (review counterexample: 5 events → 0 events, "success").
-  function* gen() { yield* f.rows }
-  const fromGen = await migrateToV4(f.header, gen(), { childFacts: null })
-  assert.equal(fromGen.rowCount, f.rows.length, 'row count must survive phase 2')
-  assert.equal(fromGen.eventRows.length, f.rows.length)
-  assert.deepEqual(
-    fromGen.eventRows.map(r => JSON.stringify(r)),
-    fromArray.eventRows.map(r => JSON.stringify(r)),
-  )
+  const req = createRequire(join(rc4Dir, 'noop.js'))
+  const v23 = await import(pathToFileURL(req.resolve('@deepseek-ai/dsh-session-format-v2-to-v3')).href)
+  const codec = v23.releasedV3SessionFormatCodec
+  const id = 'session-gen-v3'
+  const v3LogicalHeader = { version: 3, id, createdAt: 1793500000000, cwd: '/tmp/proj', isSeeded: false, delegationDepth: 0 }
+  const e = (type, seq, data, extra = {}) => ({ type, seq, time: seq + 100, data, ...extra })
+  const logicalEvents = [
+    e('turn/start', 0, { turn: 1 }),
+    e('user/message', 1, { id: `${id}-user`, role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '生成器回归' }] }, { surfaceOp: 'append' }),
+    e('step/start', 2, { turn: 1, step: 1 }),
+    e('step/end', 3, { turn: 1, step: 1 }),
+    e('turn/end', 4, { turn: 1, reason: { kind: 'completed' } }),
+  ]
+  const physicalHeader = codec.encodeHeader(v3LogicalHeader, 0)
+  const physicalRows = logicalEvents.map(ev => codec.encodeEvent(ev))
+
+  const fromArray = await migrateToV4(physicalHeader, physicalRows, { childFacts: null })
+  assert.equal(fromArray.eventRows.length, logicalEvents.length)
+  function* gen() { yield* physicalRows }
+  const fromGen = await migrateToV4(physicalHeader, gen(), { childFacts: null })
+  assert.equal(fromGen.rowCount, physicalRows.length, 'row count must survive BOTH historical passes')
+  assert.equal(fromGen.eventRows.length, logicalEvents.length, 'legacy generator input must not silently yield 0 events')
+  assert.deepEqual(fromGen.eventRows.map(r => JSON.stringify(r)), fromArray.eventRows.map(r => JSON.stringify(r)))
+  assert.equal(fromGen.headerRow.version, 4)
+  assert.equal(fromGen.headerRow.id, id)
+  assert.equal(fromGen.inheritedEventCount, fromArray.inheritedEventCount)
+  assert.ok(fromGen.eventRows.map(r => JSON.stringify(r)).join('|').includes('生成器回归'), 'original text must survive')
 })
 
 test('R2: round-trip self-check rejects content-changing fault injection', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
@@ -513,6 +528,18 @@ test('R5: precise legacy codes — chronology/child-evidence/row-decode/round-tr
     },
   )
 
+  // SAME chronology refusal through the PARENT entry: restoreParentWithChildren
+  // used to wrap every decode error as ROW_DECODE_FAILED — the entry point
+  // must not change the classification (F7).
+  await assert.rejects(
+    () => restoreParentWithChildren(v2Header, surfFirst, []),
+    error => {
+      assert.equal(error.code, LEGACY_CODES.CHRONOLOGY_UNREACHABLE, `parent entry must classify chronology identically, got ${error.code}`)
+      assert.match(error.message, /system head/)
+      return true
+    },
+  )
+
   // ROUNDTRIP_MISMATCH: direct assertion via the comparator.
   const { assertDeepRoundTrip } = await import('../lib/migration/legacy-chain.js')
   assert.throws(
@@ -570,12 +597,18 @@ test('R4 matrix: same legal parent catalog + MATCHING fact succeeds (3 events)',
 })
 
 test('R4 matrix: same parent catalog + CONFLICTING childCreatedAt fact → official refusal (conflicts with its parent catalog)', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
-  const { restoreParentWithChildren } = await loadChain()
+  const { restoreParentWithChildren, LEGACY_CODES } = await loadChain()
   const { header, rows } = parentWithCatalogRow({ childId: 'child-a', mode: 'continuable', version: 1, provider: 'p', label: 'l', childCreatedAt: 1793500001000 })
   const conflictingFact = { childId: 'child-a', childCreatedAt: 9999999999999, descriptorCount: 1, descriptor: { provider: 'p', version: 1, mode: 'continuable', label: 'l' } }
   await assert.rejects(
     () => restoreParentWithChildren(header, rows, [conflictingFact]),
-    error => /conflicts with its parent catalog/i.test(error.message ?? ''),
+    error => {
+      // Precise class: a parent/child time conflict is child-evidence
+      // evidence conflict, not a generic bad row.
+      assert.equal(error.code, LEGACY_CODES.CHILD_EVIDENCE_INCOMPLETE, `expected CHILD_EVIDENCE_INCOMPLETE, got ${error.code}`)
+      assert.match(error.message, /conflicts with its parent catalog/i)
+      return true
+    },
   )
 })
 

@@ -2,22 +2,25 @@
 // dsh-dsha-migrator inspect CLI — READ-ONLY diagnostic tool (P1 unified entry).
 //
 // Default mode: the full read-only pipeline from lib/inspect-sessions.js —
-// archive verification → controlled private staging → highest canonical
-// generation selection → header/location binding → official recovery chain →
-// canonical v4 round-trip self-check → sanitized per-session report
-// (importable / refused + code). Staging lives in a temp directory and is
-// removed when the run ends; nothing is written to the archive or to any
-// target DSH; chat content and credentials are never printed.
+// archive verification → controlled private staging (canonical allowlist) →
+// highest canonical generation selection → header/location binding →
+// direct-child evidence binding → official recovery chain → canonical v4
+// round-trip self-check → sanitized per-session report. Staging lives in a
+// temp directory (or --staging-root) and is REMOVED and VERIFIED REMOVED
+// before the cleanup receipt is printed; the process exits naturally so
+// cleanup cannot be skipped (process.exit would bypass the finally block —
+// the bug that left private session copies on disk).
 //
 // --inventory: lightweight archive census only (no staging, no session
 // restore) — kept as a fast diagnostic; NOT a session importability verdict.
 //
-// Usage: node bin/inspect.mjs <backup-file> [--inventory] [--limits k=v,…]
+// Usage: node bin/inspect.mjs <backup-file> [--inventory]
+//        [--staging-root <dir>] [--limits k=v,…]
 
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, rmSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { inspectSessions } from '../lib/inspect-sessions.js'
+import { inspectSessions, CANONICAL_SESSION_LOG_RE, sanitizeRoots } from '../lib/inspect-sessions.js'
 
 function parseLimits(spec) {
   if (!spec) return {}
@@ -37,34 +40,39 @@ function parseLimits(spec) {
 const args = process.argv.slice(2)
 const file = args.find(a => !a.startsWith('--'))
 const inventoryOnly = args.includes('--inventory')
+const stagingIdx = args.indexOf('--staging-root')
+const explicitStagingRoot = stagingIdx !== -1 ? args[stagingIdx + 1] : null
 const limitsIdx = args.indexOf('--limits')
 let limits = {}
 if (limitsIdx !== -1) limits = parseLimits(args[limitsIdx + 1])
 
 if (!file) {
-  console.error('Usage: node bin/inspect.mjs <backup-file> [--inventory] [--limits k=v,…]')
+  console.error('Usage: node bin/inspect.mjs <backup-file> [--inventory] [--staging-root <dir>] [--limits k=v,…]')
   console.error('Read-only: verifies the archive, restores sessions through the official chain, prints a sanitized report.')
-  process.exit(3)
+  process.exitCode = 3
+} else if (inventoryOnly) {
+  runInventory()
+} else {
+  await runSessions()
 }
 
-const started = Date.now()
-const tool = { tool: 'dsh-dsha-migrator inspect', at: new Date().toISOString(), file }
-
-if (inventoryOnly) {
+async function runInventory() {
   // Light diagnostic census: manifest + canonical-name inventory (counts
   // generation files; does NOT choose generations or restore sessions).
-  const { readV5Backup } = await import('../lib/archive/v5-reader.js')
+  const started = Date.now()
+  const tool = { tool: 'dsh-dsha-migrator inspect', at: new Date().toISOString(), file, mode: 'inventory' }
   try {
+    const { readV5Backup } = await import('../lib/archive/v5-reader.js')
     const sessions = []
     const onRecord = (meta, info) => {
       if (meta.root !== 'sessions' || meta.kind !== 'FILE') return
       const name = meta.path.split('/').at(-1)
-      const m = /^session(?:\.v(\d+))?\.jsonl(?:\.(zstd))?$/.exec(name)
-      if (!m) return
+      if (!CANONICAL_SESSION_LOG_RE.test(name)) return
+      const m = /^session(?:\.v(\d+))?/.exec(name)
       sessions.push({
         path: meta.path,
         generation: m[1] === undefined ? 0 : Number(m[1]),
-        compressed: Boolean(m[2]),
+        compressed: name.endsWith('.zstd'),
         bytes: meta.size,
         sha256: info?.sha256 ?? meta.sha256,
       })
@@ -84,7 +92,6 @@ if (inventoryOnly) {
     for (const s of sessions) census[s.generation] = (census[s.generation] ?? 0) + 1
     console.log(JSON.stringify({
       ...tool,
-      mode: 'inventory',
       durationMs: Date.now() - started,
       verified: true,
       manifest: {
@@ -98,7 +105,7 @@ if (inventoryOnly) {
         runtime: manifest.runtime,
         entries: manifest.entries,
         bytes: manifest.bytes,
-        roots: (manifest.roots ?? []).map(r => ({ id: r.id, scope: r.scope, name: r.name })),
+        roots: sanitizeRoots(manifest.roots),
       },
       stats: {
         containerBytes: stats.containerBytes,
@@ -111,46 +118,69 @@ if (inventoryOnly) {
       },
       sessions: { count: sessions.length, byLocation, generationCensus: census },
     }, null, 2))
+    process.exitCode = 0
   } catch (error) {
-    console.log(JSON.stringify({ ...tool, mode: 'inventory', durationMs: Date.now() - started, verified: false, error: { message: error.message, code: error.code ?? null } }, null, 2))
-    process.exit(1)
+    console.log(JSON.stringify({ ...tool, durationMs: Date.now() - started, verified: false, error: { message: error.message, code: error.code ?? null } }, null, 2))
+    process.exitCode = 1
   }
-  process.exit(0)
 }
 
-// Default: full read-only pipeline. Staging is private and temporary.
-// Outside the host, RC4_MODULES points at a node_modules holding the
-// official 0.2.1-rc.4 packages; inside the host the bare names resolve.
-if (process.env.RC4_MODULES) {
-  const { createRequire } = await import('node:module')
-  const { pathToFileURL } = await import('node:url')
-  const { setModuleLoader } = await import('../lib/migration/legacy-chain.js')
-  const req = createRequire(join(process.env.RC4_MODULES, 'noop.js'))
-  await setModuleLoader(async () => ({
-    cat: await import(pathToFileURL(req.resolve('@deepseek-ai/dsh-session-format-catalog')).href),
-    v3: await import(pathToFileURL(req.resolve('@deepseek-ai/dsh-session-format-v3-to-v4')).href),
-  }))
-}
-const stagingRoot = mkdtempSync(join(tmpdir(), 'dsha-inspect-'))
-try {
-  const report = await inspectSessions(file, { stagingRoot, limits })
-  console.log(JSON.stringify({
-    ...tool,
-    mode: 'sessions',
-    durationMs: Date.now() - started,
-    archiveVerified: !report.archiveFailed,
-    archive: report.archive,
-    ambiguous: report.ambiguous,
-    sessions: report.sessions,
-    counts: report.counts,
-    staging: { ...report.stagingSummary, cleanedUp: true },
-    errors: report.errors,
-    archiveFailed: report.archiveFailed ?? false,
-  }, null, 2))
-  process.exit(report.archiveFailed ? 1 : 0)
-} catch (error) {
-  console.log(JSON.stringify({ ...tool, mode: 'sessions', durationMs: Date.now() - started, verified: false, error: { message: error.message, code: error.code ?? null } }, null, 2))
-  process.exit(1)
-} finally {
-  rmSync(stagingRoot, { recursive: true, force: true })
+async function runSessions() {
+  const started = Date.now()
+  const tool = { tool: 'dsh-dsha-migrator inspect', at: new Date().toISOString(), file, mode: 'sessions' }
+  // Outside the host, RC4_MODULES points at a node_modules holding the
+  // official 0.2.1-rc.4 packages; inside the host the bare names resolve.
+  if (process.env.RC4_MODULES) {
+    const { createRequire } = await import('node:module')
+    const { pathToFileURL } = await import('node:url')
+    const { setModuleLoader } = await import('../lib/migration/legacy-chain.js')
+    const req = createRequire(join(process.env.RC4_MODULES, 'noop.js'))
+    await setModuleLoader(async () => ({
+      cat: await import(pathToFileURL(req.resolve('@deepseek-ai/dsh-session-format-catalog')).href),
+      v3: await import(pathToFileURL(req.resolve('@deepseek-ai/dsh-session-format-v3-to-v4')).href),
+    }))
+  }
+  // The staging root is created here (temp) or taken from --staging-root so
+  // acceptance tests can verify its removal after this process exits.
+  const ownsStaging = !explicitStagingRoot
+  const stagingRoot = explicitStagingRoot ?? mkdtempSync(join(tmpdir(), 'dsha-inspect-'))
+  let payload = null
+  let exitCode = 0
+  try {
+    const report = await inspectSessions(file, { stagingRoot, limits })
+    payload = {
+      ...tool,
+      durationMs: Date.now() - started,
+      archiveVerified: !report.archiveFailed,
+      archive: report.archive,
+      ambiguous: report.ambiguous,
+      childEvidence: report.childEvidence,
+      sessions: report.sessions,
+      counts: report.counts,
+      stagingSummary: report.stagingSummary,
+      errors: report.errors,
+      archiveFailed: report.archiveFailed ?? false,
+    }
+    exitCode = report.archiveFailed ? 1 : 0
+  } catch (error) {
+    payload = { ...tool, durationMs: Date.now() - started, verified: false, error: { message: error.message, code: error.code ?? null } }
+    exitCode = 1
+  }
+  // Cleanup FIRST, verify the removal, then emit the receipt — the receipt
+  // must describe what actually happened, never a hardcoded true, and must
+  // NOT echo the local staging path.
+  let cleanup = { cleanedUp: false, removedRoot: ownsStaging ? '<temp>' : 'caller-provided' }
+  try {
+    rmSync(stagingRoot, { recursive: true, force: true })
+  } catch (error) {
+    cleanup.cleanupError = error.message.slice(0, 200)
+  }
+  cleanup.cleanedUp = !existsSync(stagingRoot)
+  if (!cleanup.cleanedUp && !cleanup.cleanupError) {
+    cleanup.cleanupError = 'staging root still exists after rmSync'
+  }
+  // Sanitized staging summary is part of the payload (no absolute paths);
+  // the cleanup receipt is appended after verified removal.
+  console.log(JSON.stringify({ ...payload, staging: cleanup }, null, 2))
+  process.exitCode = exitCode
 }
