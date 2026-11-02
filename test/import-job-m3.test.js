@@ -142,6 +142,7 @@ test('P2 M3 run: attachments published BEFORE sessions, readback verified, works
       readAttachmentSource: async () => fileBytes,
       attachmentExists: async () => false,
       withdrawSession: withdraw,
+      allowUnprotected: true,
     })
     assert.equal(result.status, 'DONE', JSON.stringify(result))
     // attachments-first ordering in the journal
@@ -190,6 +191,7 @@ test('P2 M3 run: an existing identical session yields REPLAN_REQUIRED with no ta
       target: t,
       sessions: [s1],
       withdrawSession: async () => { throw new Error('must not withdraw an existing session') },
+      allowUnprotected: true,
     })
     assert.equal(result.status, 'REPLAN_REQUIRED')
     assert.equal(result.existing[0].classification, 'identical')
@@ -231,6 +233,7 @@ test('P2 M3 run: a failure after session creation rolls back through protected w
       target: t,
       sessions: [ghostWorkspace],
       withdrawSession: withdraw,
+      allowUnprotected: true,
     })
     assert.ok(['ROLLED_BACK', 'ROLLBACK_PENDING', 'FAILED'].includes(result.status), JSON.stringify(result))
     assert.equal(await t.persistence.stat('m3-fail'), undefined, 'the created session was withdrawn')
@@ -270,6 +273,7 @@ test('P2 M3 resume: a restored mid-import journal demands an explicit recovery j
       target: t,
       sessions: [s1],
       withdrawSession: async () => { throw new Error('no withdrawal during a recovery check') },
+      allowUnprotected: true,
     })
     assert.equal(first.status, 'RECOVERY_REQUIRED', JSON.stringify(first))
     assert.equal(first.recovery.batchState, 'IMPORTING')
@@ -287,6 +291,7 @@ test('P2 M3 resume: a restored mid-import journal demands an explicit recovery j
       sessions: [s1],
       withdrawSession: async () => { withdrawCalls += 1 },
       recoveredJudgment: { resolveOpenIntents: 'rollback' },
+      allowUnprotected: true,
     })
     assert.ok(['ROLLBACK_PENDING', 'ROLLED_BACK'].includes(second.status), JSON.stringify(second))
     assert.equal(withdrawCalls, 0, 'an unconfirmed import intent is never auto-withdrawn')
@@ -319,6 +324,7 @@ test('P2 M3 cancel: a pre-aborted run compensates at the safe boundary and repor
       sessions: [s1],
       withdrawSession: async () => { throw new Error('nothing was written, nothing to withdraw') },
       signal: controller.signal,
+      allowUnprotected: true,
     })
     assert.ok(['CANCELLED', 'CANCELLED_ROLLBACK_PENDING'].includes(result.status), JSON.stringify(result))
     assert.equal(await t.persistence.stat('m3-cancel'), undefined, 'no session was created')

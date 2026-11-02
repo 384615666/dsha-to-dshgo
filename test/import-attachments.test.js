@@ -126,8 +126,13 @@ test('P2 M2 publish: normalized images are copied byte-for-byte (no re-encode); 
     const result = await publishAttachments({ store: t.store, attachmentRoot: t.root, planned })
     assert.equal(result.reused.length, 1)
     assert.equal(result.published.length, 1)
-    const filePublished = result.published[0]
+    const filePublished = result.published.find(x => x.kind === 'file')
+    assert.ok(filePublished, 'the file is the newly created object')
+    assert.equal(filePublished.owned, true, 'file creation is reported owned when the store created it')
     assert.equal(filePublished.attachmentId, `sha256:${sha(fileBytes)}`)
+    // the reused image is honestly reported NOT owned (existed before this batch)
+    const imageReused = result.reused.find(x => x.kind === 'image')
+    assert.equal(imageReused.owned, false)
     // official readback: exact file bytes
     const chunks = []
     for await (const chunk of t.store.readFileStream({ attachmentId: filePublished.attachmentId, name: 'hello.txt', bytes: fileBytes.length })) chunks.push(Buffer.from(chunk))
@@ -147,6 +152,7 @@ test('P2 M2 publish: normalized images are copied byte-for-byte (no re-encode); 
     const again = await publishAttachments({ store: t.store, attachmentRoot: t.root, planned: planned2 })
     assert.equal(again.published.length, 0)
     assert.equal(again.reused.length, 2)
+    assert.ok(again.reused.every(x => x.owned === false))
   } finally {
     await t.unmount()
   }
