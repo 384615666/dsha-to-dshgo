@@ -1,19 +1,29 @@
-// R3 acceptance: the unified read-only orchestrator (inspectSessions) —
-// generation selection, v0 canonical-name recognition, no-fallback on a
-// corrupt highest generation, ambiguity isolation, and archive-failure
-// cleanup. Selection/reading tests are synthetic; restore-verdict tests need
-// the official rc.4 packages (RC4_MODULES), like the legacy-chain suite.
+// R3/F-series acceptance: the unified read-only orchestrator (inspectSessions).
+// Generation selection, v0 canonical recognition (plain AND compressed), no
+// fallback on a corrupt highest, ambiguity isolation, archive-failure
+// cleanup, VERIFIED binding through the OFFICIAL location backend, direct
+// child evidence (v3 and v4 children), identity-validated unavailable facts,
+// strict decoding with parsing-time budgets, exclusion rules, container-
+// semantics staging, and truthful cleanup receipts.
+//
+// Restore-verdict and location tests need the official rc.4 packages
+// (RC4_MODULES), like the legacy-chain suite. RC4_MODULES must point at a
+// node_modules that ALSO carries @deepseek-ai/dsh-session-persistence-jsonl
+// and @deepseek-ai/cordis (the full engine install) so the official location
+// adapter can mount; without it, sessions are admitted only as
+// location-unverified (never importable).
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, writeFileSync, rmSync, mkdirSync, existsSync } from 'node:fs'
+import { mkdtempSync, writeFileSync, rmSync, mkdirSync, existsSync, readdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, relative, sep } from 'node:path'
 import zlib from 'node:zlib'
-import { createHash } from 'node:crypto'
 import { createRequire } from 'node:module'
 import { pathToFileURL } from 'node:url'
-import { inspectSessions } from '../lib/inspect-sessions.js'
-import { buildV5Archive, fileEntry } from './helpers/v5-fixture.mjs'
+import { inspectSessions, readSessionFile } from '../lib/inspect-sessions.js'
+import { setLocationAdapter } from '../lib/migration/location.js'
+import { splitZstdFrames, decompressZstdMultiFrame } from '../lib/archive/zstd-frames.js'
+import { buildV5Archive, fileEntry, missingEntry } from './helpers/v5-fixture.mjs'
 
 const rc4Dir = process.env.RC4_MODULES
 const skip = !rc4Dir
@@ -27,11 +37,38 @@ async function injectLoader() {
   }))
 }
 
+// Mount the OFFICIAL JSONL persistence backend on an isolated throwaway root
+// and expose its own locate() as the location adapter. Returns an unmount
+// function. Locate only computes paths; the root is removed afterwards.
+async function mountLocation() {
+  const req = createRequire(join(rc4Dir, 'noop.js'))
+  const jsonl = await import(pathToFileURL(req.resolve('@deepseek-ai/dsh-session-persistence-jsonl')).href)
+  const { Context } = await import(pathToFileURL(req.resolve('@deepseek-ai/cordis')).href)
+  const backendRoot = mkdtempSync(join(tmpdir(), 'locate-root-'))
+  const ctx = new Context()
+  await ctx.plugin(jsonl, { root: backendRoot, compression: 'zstd' })
+  const store = ctx.sessionPersistence
+  if (typeof store?.locate !== 'function') throw new Error('official backend locate unavailable')
+  await setLocationAdapter(header => {
+    const loc = store.locate({ cwd: header.cwd, id: header.id })
+    return relative(backendRoot, loc.path).split(sep).slice(0, -1).join('/')
+  })
+  return async () => {
+    await setLocationAdapter(null)
+    try { await ctx.fiber?.dispose?.() } catch { /* best effort */ }
+    rmSync(backendRoot, { recursive: true, force: true })
+  }
+}
+
 // Header rows the official chain accepts per generation (v3+ need isSeeded;
 // its absence demotes a v3 header to the v2 shape).
-const headerRow = (version, id) => Buffer.from(JSON.stringify({
-  type: 'session', version, id, createdAt: 1, cwd: '/w', delegationDepth: 0, isSeeded: version >= 3 ? false : undefined,
+const headerRow = (version, id, cwd = '/w') => Buffer.from(JSON.stringify({
+  type: 'session', version, id, createdAt: 1, cwd, delegationDepth: 0, isSeeded: version >= 3 ? false : undefined,
 }) + '\n')
+
+// The OFFICIAL directory slot for cwd '/w' is '--w--' (backend-verified in
+// the location tests); fixtures must use the official layout, not 'proj/…'.
+const officialDirFor = id => `--w--/${id}`
 
 function sessionFile(root, scope, project, sessionId, fileName, content) {
   if (fileName.endsWith('.zstd')) {
@@ -46,7 +83,6 @@ const text = t => Buffer.from(t)
 // the one-line header). Node's zstdDecompressSync handles exactly one frame,
 // so a naive single call silently drops every event after the first frame.
 test('readSessionFile: multi-frame zstd decodes ALL rows; trailing garbage refuses', async () => {
-  const { readSessionFile } = await import('../lib/inspect-sessions.js')
   const header = Buffer.from(JSON.stringify({ type: 'session', version: 4, id: 'mf', createdAt: 1, cwd: '/w', isSeeded: false, delegationDepth: 0 }) + '\n')
   const rowA = Buffer.from(JSON.stringify({ type: 'turn/start', seq: 0, time: 100, data: { turn: 1 } }) + '\n')
   const rowB = Buffer.from(JSON.stringify({ type: 'turn/end', seq: 1, time: 101, data: { turn: 1, reason: { kind: 'completed' } } }) + '\n')
@@ -65,19 +101,65 @@ test('readSessionFile: multi-frame zstd decodes ALL rows; trailing garbage refus
   assert.equal(plain.rows.length, 2)
 })
 
+test('F5: invalid UTF-8 and truncated skippable tails refuse; budgets bound DURING parsing', async () => {
+  const header = Buffer.from(JSON.stringify({ type: 'session', version: 4, id: 'x', createdAt: 1, cwd: '/w', isSeeded: false, delegationDepth: 0 }) + '\n')
+  // 1) raw invalid UTF-8 inside a JSON string position: fatal decode refuses
+  const badUtf8 = Buffer.concat([header, Buffer.from([0xff, 0xfe]), Buffer.from('\n')])
+  assert.throws(() => readSessionFile(badUtf8, { compressed: false }), /UTF-8/)
+  // 2) complete session + 8-byte skippable header claiming 1024 B payload:
+  //    the declared payload must be present, never skipped past EOF
+  const framed = zlib.zstdCompressSync(header)
+  const skippable = Buffer.alloc(8)
+  skippable.writeUInt32LE(0x184d2a50, 0)
+  skippable.writeUInt32LE(1024, 4)
+  assert.throws(() => splitZstdFrames(Buffer.concat([framed, skippable])), /skippable frame payload overruns/)
+  // 3) per-session budgets: decompressed size and rows refuse (fixed codes)
+  assert.throws(
+    () => readSessionFile(Buffer.concat([header, header]), { compressed: false }, { maxDecompressedBytes: 10 }),
+    err => err.code === 'SESSION_BUDGET',
+  )
+  assert.throws(
+    () => readSessionFile(Buffer.concat([header, Buffer.from('{"t":1}\n')]), { compressed: false }, { maxRows: 0 }),
+    err => err.code === 'SESSION_BUDGET',
+  )
+  // 4) budget stops the run DURING decoding: the second frame is CORRUPT, so
+  // if the decoder touched it the error would be "bad zstd magic" — the
+  // budget error proves later frames were neither walked nor decoded.
+  const goodFrame = zlib.zstdCompressSync(Buffer.from('x'.repeat(2000)))
+  const corruptFrame = Buffer.from([1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
+  assert.throws(
+    () => decompressZstdMultiFrame(Buffer.concat([goodFrame, corruptFrame]), { maxBytes: 100 }),
+    err => /budget/.test(err.message),
+    'budget must stop before any later frame is touched',
+  )
+  // 5) row JSON errors carry a FIXED message (no source fragments) and the
+  // parsed header for identity salvage — no second unbounded decompression.
+  const badRow = Buffer.concat([header, Buffer.from('{"x": "SYNTHCHAT-marker" NOPE\n')])
+  try {
+    readSessionFile(badRow, { compressed: false })
+    assert.fail('corrupt row must refuse')
+  } catch (error) {
+    assert.equal(error.code, 'SESSION_ROW_MALFORMED')
+    assert.equal(error.message, 'physical row 1 is not valid JSON')
+    assert.ok(error.header, 'parsed header must be attached for verified identity salvage')
+    assert.ok(!error.message.includes('SYNTHCHAT-marker'), 'error text must not echo the damaged row content')
+  }
+})
+
 test('R3: highest generation wins; v0 canonical session.jsonl is recognized; lower generations discarded are listed', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
   await injectLoader()
+  const unmount = await mountLocation()
   const dir = mkdtempSync(join(tmpdir(), 'r3-sel-'))
   try {
     const gz = buildV5Archive([
       // highest-only: v4 alone
-      sessionFile('sessions', 'sessions', 'proj', 's-v4', 'session.v4.jsonl.zstd', headerRow(4, 's-v4')),
+      sessionFile('sessions', 'sessions', '--w--', 's-v4', 'session.v4.jsonl.zstd', headerRow(4, 's-v4')),
       // v0 canonical name (no version segment): must be recognized; the
       // official chain gives its own verdict (header-only v0 is accepted).
-      sessionFile('sessions', 'sessions', 'proj', 's-v0', 'session.jsonl', headerRow(0, 's-v0')),
+      sessionFile('sessions', 'sessions', '--w--', 's-v0', 'session.jsonl', headerRow(0, 's-v0')),
       // mixed dir: v3 + v4 → v4 wins, v3 listed as discarded lower
-      sessionFile('sessions', 'sessions', 'proj', 's-mix', 'session.v3.jsonl', headerRow(3, 's-mix')),
-      sessionFile('sessions', 'sessions', 'proj', 's-mix', 'session.v4.jsonl', headerRow(4, 's-mix')),
+      sessionFile('sessions', 'sessions', '--w--', 's-mix', 'session.v3.jsonl', headerRow(3, 's-mix')),
+      sessionFile('sessions', 'sessions', '--w--', 's-mix', 'session.v4.jsonl', headerRow(4, 's-mix')),
     ])
     const backup = join(dir, 'backup.gz')
     writeFileSync(backup, gz)
@@ -90,7 +172,8 @@ test('R3: highest generation wins; v0 canonical session.jsonl is recognized; low
     assert.equal(byId.get('s-v4').status, 'restored')
     assert.equal(byId.get('s-v4').importable, true)
     assert.deepEqual(byId.get('s-v4').filesDiscardedLower, [])
-    // v0 canonical name recognized and given the official chain's verdict
+    // v0 canonical name recognized (gen 0 selected) and given the official
+    // chain's verdict: this header-only v0 shape is accepted (empty session).
     assert.equal(byId.get('s-v0').status, 'restored')
     assert.equal(byId.get('s-v0').sourceGeneration, 0)
     assert.equal(byId.get('s-v0').outputGeneration, 4)
@@ -100,20 +183,22 @@ test('R3: highest generation wins; v0 canonical session.jsonl is recognized; low
     assert.deepEqual(byId.get('s-mix').filesDiscardedLower, ['session.v3.jsonl'])
   } finally {
     rmSync(dir, { recursive: true, force: true })
+    await unmount()
   }
 })
 
 test('R3: corrupt highest generation does NOT fall back — the session is refused', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
   await injectLoader()
+  const unmount = await mountLocation()
   const dir = mkdtempSync(join(tmpdir(), 'r3-corrupt-'))
   try {
     // Corrupt "v5": text garbage in a .v5.jsonl — highest generation on top.
     const v5garbage = Buffer.from('not json at all\nsecond line\n')
     const gz = buildV5Archive([
-      sessionFile('sessions', 'sessions', 'proj', 's-cor', 'session.v5.jsonl', v5garbage),
-      sessionFile('sessions', 'sessions', 'proj', 's-cor', 'session.v3.jsonl', headerRow(3, 's-cor')),
+      sessionFile('sessions', 'sessions', '--w--', 's-cor', 'session.v5.jsonl', v5garbage),
+      sessionFile('sessions', 'sessions', '--w--', 's-cor', 'session.v3.jsonl', headerRow(3, 's-cor')),
       // a control session that must restore fine
-      sessionFile('sessions', 'sessions', 'proj', 's-good', 'session.v4.jsonl', headerRow(4, 's-good')),
+      sessionFile('sessions', 'sessions', '--w--', 's-good', 'session.v4.jsonl', headerRow(4, 's-good')),
     ])
     const backup = join(dir, 'backup.gz')
     writeFileSync(backup, gz)
@@ -128,6 +213,7 @@ test('R3: corrupt highest generation does NOT fall back — the session is refus
     assert.ok((corrupt.error ?? '').length > 0)
   } finally {
     rmSync(dir, { recursive: true, force: true })
+    await unmount()
   }
 })
 
@@ -151,26 +237,8 @@ test('R3: archive-level failure stages nothing publishable and cleans up', async
   }
 })
 
-test('R3: real backup passes through the unified entry (env-gated)', { skip: !process.env.DSHA_V5_REAL ? 'DSHA_V5_REAL not set' : false }, async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'r3-real-'))
-  try {
-    const stagingRoot = join(dir, 'staging')
-    const r = await inspectSessions(process.env.DSHA_V5_REAL, { stagingRoot })
-    assert.equal(r.archiveFailed, undefined)
-    assert.equal(r.counts.total, 2)
-    assert.equal(r.counts.importable, 2)
-    for (const s of r.sessions) {
-      assert.equal(s.status, 'restored')
-      assert.equal(s.sourceGeneration, 4)
-      assert.ok([596, 454].includes(s.events), `event count ${s.events}`)
-    }
-  } finally {
-    rmSync(dir, { recursive: true, force: true })
-  }
-})
-
 // ---------------------------------------------------------------------------
-// F2/F4/F5/F6 acceptance (official-chain verdicts need the rc.4 packages).
+// Official codec fixtures for child-evidence and binding tests.
 // ---------------------------------------------------------------------------
 
 const v3codec = async () => {
@@ -181,10 +249,10 @@ const v3codec = async () => {
 
 // Physical v3 session bytes through the OFFICIAL codec (physical header has
 // no type field; events carry surfaceOp).
-function v3SessionBytes(codec, id, { origin, parentSession, descriptor } = {}) {
+function v3SessionBytes(codec, id, { origin, parentSession, descriptor, cwd = '/w' } = {}) {
   const e = (type, seq, data, extra = {}) => ({ type, seq, time: seq + 100, data, ...extra })
   const header = codec.encodeHeader({
-    version: 3, id, createdAt: 1793500000000, cwd: '/w', isSeeded: false, delegationDepth: origin ? 1 : 0,
+    version: 3, id, createdAt: 1793500000000, cwd, isSeeded: false, delegationDepth: origin ? 1 : 0,
     ...(origin ? { origin, parentSession } : {}),
   }, 0)
   const logical = [
@@ -201,14 +269,15 @@ function v3SessionBytes(codec, id, { origin, parentSession, descriptor } = {}) {
 
 test('F2: parent + direct subagent child binds evidence (catalog event added); unrelated child stays unmatched', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
   await injectLoader()
+  const unmount = await mountLocation()
   const codec = await v3codec()
   const dir = mkdtempSync(join(tmpdir(), 'f2-bind-'))
   try {
     const gz = buildV5Archive([
-      fileEntry('sessions', 'proj/parent-p/session.v3.jsonl', v3SessionBytes(codec, 'parent-p'), 'sessions'),
-      fileEntry('sessions', 'proj/child-a/session.v3.jsonl', v3SessionBytes(codec, 'child-a', { origin: 'subagent', parentSession: 'parent-p', descriptor: { provider: 'p', version: 1, mode: 'continuable', label: 'l' } }), 'sessions'),
+      fileEntry('sessions', `${officialDirFor('parent-p')}/session.v3.jsonl`, v3SessionBytes(codec, 'parent-p'), 'sessions'),
+      fileEntry('sessions', `${officialDirFor('child-a')}/session.v3.jsonl`, v3SessionBytes(codec, 'child-a', { origin: 'subagent', parentSession: 'parent-p', descriptor: { provider: 'p', version: 1, mode: 'continuable', label: 'l' } }), 'sessions'),
       // another parent's child: its fact must NOT mix into parent-p
-      fileEntry('sessions', 'proj/child-q/session.v3.jsonl', v3SessionBytes(codec, 'child-q', { origin: 'subagent', parentSession: 'parent-z', descriptor: { provider: 'p', version: 1, mode: 'continuable', label: 'z' } }), 'sessions'),
+      fileEntry('sessions', `${officialDirFor('child-q')}/session.v3.jsonl`, v3SessionBytes(codec, 'child-q', { origin: 'subagent', parentSession: 'parent-z', descriptor: { provider: 'p', version: 1, mode: 'continuable', label: 'z' } }), 'sessions'),
     ])
     const backup = join(dir, 'b.gz')
     writeFileSync(backup, gz)
@@ -229,64 +298,127 @@ test('F2: parent + direct subagent child binds evidence (catalog event added); u
     assert.ok(r.childEvidence.unmatchedFacts.some(u => u.child === 'child-q' && u.parent === 'parent-z'))
   } finally {
     rmSync(dir, { recursive: true, force: true })
+    await unmount()
   }
 })
 
-test('F2: confirmed-empty child set restores a standalone historical parent; unreadable-rows child contributes an identity-validated unavailable fact', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
+test('F2: v4 direct child binds through the official chain (no blanket version rejection)', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
   await injectLoader()
+  const unmount = await mountLocation()
+  const codec = await v3codec()
+  const dir = mkdtempSync(join(tmpdir(), 'f2-v4-'))
+  try {
+    const req = createRequire(join(rc4Dir, 'noop.js'))
+    const cat = await import(pathToFileURL(req.resolve('@deepseek-ai/dsh-session-format-catalog')).href)
+    const e = (type, seq, data) => ({ type, seq, time: seq + 100, data })
+    const h = cat.sessionFormatCatalog.encodeCurrentHeader({
+      version: 4, id: 'kid-v4', createdAt: 1793500001000, cwd: '/w', isSeeded: false, delegationDepth: 1, origin: 'subagent', parentSession: 'p-v4k',
+    }, 0)
+    const rows = [e('turn/start', 0, { turn: 1 }), e('turn/end', 1, { turn: 1, reason: { kind: 'completed' } })]
+      .map(ev => cat.sessionFormatCatalog.encodeCurrentEvent(ev))
+    const v4Child = Buffer.from([JSON.stringify(h), ...rows.map(r => JSON.stringify(r))].join('\n') + '\n')
+    const gz = buildV5Archive([
+      fileEntry('sessions', `${officialDirFor('p-v4k')}/session.v3.jsonl`, v3SessionBytes(codec, 'p-v4k'), 'sessions'),
+      fileEntry('sessions', `${officialDirFor('kid-v4')}/session.v4.jsonl`, v4Child, 'sessions'),
+    ])
+    const backup = join(dir, 'b.gz')
+    writeFileSync(backup, gz)
+    const r = await inspectSessions(backup, { stagingRoot: join(dir, 'staging') })
+    const parent = r.sessions.find(s => s.id === 'p-v4k')
+    assert.equal(parent.status, 'restored', `v4 child must follow the official chain verdict, not a local version rule (${parent.error ?? ''})`)
+    assert.equal(parent.importable, true)
+    assert.deepEqual(r.childEvidence.declared, [{ parent: 'p-v4k', child: 'kid-v4', mode: 'bound' }])
+    assert.equal(parent.canonicalEvents, 3, 'v4 child fact completes the parent catalog (2 own → 3)')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+    await unmount()
+  }
+})
+
+test('F2: standalone historical parent restores with the scanned-empty set; verified unreadable child yields an unavailable fact; UNVERIFIED salvage identity yields none', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
+  await injectLoader()
+  const unmount = await mountLocation()
   const codec = await v3codec()
   const dir = mkdtempSync(join(tmpdir(), 'f2-empty-'))
   try {
-    // standalone parent: no child dirs at all
-    const goodParent = v3SessionBytes(codec, 'solo-p')
-    // parent with a child whose HEADER parses but rows are corrupt
+    // parent with a child whose HEADER parses but rows are corrupt — the
+    // header sits at the child's OWN official directory (identity verified)
     const corruptChild = Buffer.concat([
       Buffer.from(JSON.stringify(codec.encodeHeader({ version: 3, id: 'child-bad', createdAt: 1793500001000, cwd: '/w', isSeeded: false, delegationDepth: 1, origin: 'subagent', parentSession: 'p-with-bad' }, 0)) + '\n'),
       Buffer.from('{"type":"turn/start" NOT_JSON\n'),
     ])
-    const gz = buildV5Archive([
-      fileEntry('sessions', 'proj/solo-p/session.v3.jsonl', goodParent, 'sessions'),
-      fileEntry('sessions', 'proj/p-with-bad/session.v3.jsonl', v3SessionBytes(codec, 'p-with-bad'), 'sessions'),
-      fileEntry('sessions', 'proj/child-bad/session.v3.jsonl', corruptChild, 'sessions'),
+    // an IMPOSTOR: header claims a different id than its directory — the
+    // location check must disqualify it from contributing ANY fact.
+    const impostor = Buffer.concat([
+      Buffer.from(JSON.stringify(codec.encodeHeader({ version: 3, id: 'impostor', createdAt: 1793500002000, cwd: '/w', isSeeded: false, delegationDepth: 1, origin: 'subagent', parentSession: 'p-with-bad' }, 0)) + '\n'),
+      Buffer.from('{"type":"turn/start" ALSO_BROKEN\n'),
     ])
+    const gz = buildV5Archive([
+      fileEntry('sessions', `${officialDirFor('solo-p')}/session.v3.jsonl`, v3SessionBytes(codec, 'solo-p'), 'sessions'),
+      fileEntry('sessions', `${officialDirFor('p-with-bad')}/session.v3.jsonl`, v3SessionBytes(codec, 'p-with-bad'), 'sessions'),
+      fileEntry('sessions', `${officialDirFor('child-bad')}/session.v3.jsonl`, corruptChild, 'sessions'),
+      // impostor header parked in the honest child's official directory
+      fileEntry('sessions', `${officialDirFor('honest-child')}/session.v3.jsonl`, impostor, 'sessions'),
+      // declared-but-missing canonical slot must surface, never vanish
+      missingEntry('sessions', `${officialDirFor('ghost')}/session.v3.jsonl`, 'sessions'),
+    ], { manifest: { integrity: 'PARTIAL' } })
     const backup = join(dir, 'b.gz')
     writeFileSync(backup, gz)
     const r = await inspectSessions(backup, { stagingRoot: join(dir, 'staging') })
     const solo = r.sessions.find(s => s.id === 'solo-p')
     const pBad = r.sessions.find(s => s.id === 'p-with-bad')
     const badChild = r.sessions.find(s => s.id === 'child-bad')
+    const imp = r.sessions.find(s => s.id === 'honest-child')
     assert.equal(solo.status, 'restored', 'standalone parent must restore with the scanned-empty set')
     assert.equal(solo.importable, true)
     // unreadable child is REPORTED (never silently dropped) …
     assert.equal(badChild.status, 'refused')
-    // … and its salvaged identity still feeds the parent an explicit
-    // empty-descriptor fact; the official chain decides (accepted here,
-    // adding the catalog event: 2 own logical → 3 canonical).
-    assert.deepEqual(r.childEvidence.declared, [{ parent: 'p-with-bad', child: 'child-bad', mode: 'unavailable-fact' }])
+    assert.equal(badChild.code, 'SESSION_ROW_MALFORMED')
+    assert.ok(!JSON.stringify(r).includes('NOT_JSON'), 'fixed error text must not echo the damaged row')
+    // … and its VERIFIED identity feeds the parent an explicit
+    // empty-descriptor fact; the official chain decides (accepted: 2 own → 3).
+    assert.ok(r.childEvidence.declared.some(d => d.parent === 'p-with-bad' && d.child === 'child-bad' && d.mode === 'unavailable-fact'))
     assert.equal(pBad.status, 'restored')
     assert.equal(pBad.importable, true)
     assert.equal(pBad.canonicalEvents, 3)
+    // the impostor failed the location binding → refused, and contributed NO fact
+    assert.equal(imp.status, 'refused')
+    assert.equal(imp.code, 'LEGACY_LOCATION_MISMATCH')
+    assert.ok(!r.childEvidence.declared.some(d => d.child === 'impostor'), 'unverified salvage identity must never become a fact')
+    // declared MISSING slot survives into the report
+    assert.deepEqual(r.childEvidence.declaredMissing, [{ path: `${officialDirFor('ghost')}/session.v3.jsonl`, kind: 'MISSING' }])
   } finally {
     rmSync(dir, { recursive: true, force: true })
+    await unmount()
   }
 })
 
-test('F4: generation mismatch refuses; duplicate ids isolate BOTH; v0 compressed canonical is recognized', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
+test('F4: official location binding admits correct/canonical-encoded directories and refuses wrong ones; generation mismatch refuses; duplicate ids isolate BOTH; v0 compressed canonical is recognized', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
   await injectLoader()
+  const unmount = await mountLocation()
   const dir = mkdtempSync(join(tmpdir(), 'f4-bind-'))
   try {
     const v4 = Buffer.from(JSON.stringify({ type: 'session', version: 4, id: 's-gen', createdAt: 1, cwd: '/w', isSeeded: false, delegationDepth: 0 }) + '\n')
     const v0z = Buffer.from(JSON.stringify({ type: 'session', version: 0, id: 's-v0z', createdAt: 1, cwd: '/w', delegationDepth: 0 }) + '\n')
-    const dup = Buffer.from(JSON.stringify({ type: 'session', version: 4, id: 's-dup', createdAt: 1, cwd: '/w', isSeeded: false, delegationDepth: 0 }) + '\n')
+    const dupA = Buffer.from(JSON.stringify({ type: 'session', version: 4, id: 's-dup', createdAt: 1, cwd: '/w', isSeeded: false, delegationDepth: 0 }) + '\n')
+    const dupB = Buffer.from(JSON.stringify({ type: 'session', version: 4, id: 's-dup', createdAt: 1, cwd: '/other', isSeeded: false, delegationDepth: 0 }) + '\n')
+    const cjk = Buffer.from(JSON.stringify({ type: 'session', version: 4, id: '会话-id', createdAt: 1, cwd: '/w', isSeeded: false, delegationDepth: 0 }) + '\n')
+    // The CJK id's official slot comes from the adapter itself — raw
+    // characters are NOT the directory encoding.
+    const { officialSessionDirectory } = await import('../lib/migration/location.js')
+    const cjkDir = officialSessionDirectory({ cwd: '/w', id: '会话-id' })
     const gz = buildV5Archive([
       // legal v4 header inside a v1-named file: generation mismatch
-      fileEntry('sessions', 'proj/s-gen/session.v1.jsonl', v4, 'sessions'),
-      // v0 compressed canonical name must be SELECTED (gen 0), then refused
-      // by the official chain on its own merits
-      fileEntry('sessions', 'proj/s-v0z/session.jsonl.zstd', zlib.zstdCompressSync(v0z), 'sessions'),
-      // same id from two directories: BOTH isolated
-      fileEntry('sessions', 'pa/s-dup/session.v4.jsonl', dup, 'sessions'),
-      fileEntry('sessions', 'pb/s-dup/session.v4.jsonl', dup, 'sessions'),
+      fileEntry('sessions', `${officialDirFor('s-gen')}/session.v1.jsonl`, v4, 'sessions'),
+      // v0 compressed canonical name must be SELECTED (gen 0)
+      fileEntry('sessions', `${officialDirFor('s-v0z')}/session.jsonl.zstd`, zlib.zstdCompressSync(v0z), 'sessions'),
+      // same id from two directories (each at its OWN official location):
+      // BOTH isolated
+      fileEntry('sessions', `--w--/s-dup/session.v4.jsonl`, dupA, 'sessions'),
+      fileEntry('sessions', `--other--/s-dup/session.v4.jsonl`, dupB, 'sessions'),
+      // OFFICIAL encoding of a non-ASCII id must be admitted (backend's own
+      // locate() assigns the encoded directory segment)
+      fileEntry('sessions', `${cjkDir}/session.v4.jsonl`, cjk, 'sessions'),
     ])
     const backup = join(dir, 'b.gz')
     writeFileSync(backup, gz)
@@ -296,50 +428,46 @@ test('F4: generation mismatch refuses; duplicate ids isolate BOTH; v0 compressed
     assert.equal(byId.get('s-gen').sourceGeneration, 1, 'source generation comes from the FILENAME')
     const v0zEntry = byId.get('s-v0z')
     assert.equal(v0zEntry.sourceGeneration, 0, 'session.jsonl.zstd is the v0 canonical and must not vanish')
-    assert.notEqual(v0zEntry.code, 'LEGACY_DUPLICATE_SESSION_ID')
-    // The v0 canonical reaches the OFFICIAL chain's own verdict: this
-    // header-only v0 is accepted (empty historical session) — selection must
-    // not be conflated with the migration verdict.
-    assert.equal(v0zEntry.importable, true)
-    const dups = r.sessions.filter(s => s.id === 's-dup')
-    assert.equal(dups.length, 2)
-    for (const d of dups) {
-      assert.equal(d.status, 'refused')
-      assert.equal(d.code, 'LEGACY_DUPLICATE_SESSION_ID')
-    }
-    assert.equal(r.counts.importable, 1, 'only the v0 canonical; neither duplicate counts as a success')
+    assert.equal(v0zEntry.importable, true, 'header-only v0 follows the official chain verdict')
+    const dups = r.sessions.filter(s => s.code === 'LEGACY_DUPLICATE_SESSION_ID')
+    assert.equal(dups.length, 2, 'both same-id candidates isolated')
+    assert.equal(r.counts.importable, 2, 'v0 canonical + official-encoded CJK session; neither duplicate counts')
+    const cjkEntry = r.sessions.find(s => s.headerVersion === 4 && s.binding?.location === 'official-locate' && s.importable && s.id !== 's-v0z' && s.id !== 's-gen')
+    assert.ok(cjkEntry, 'the official-encoded CJK id must be admitted')
+    assert.ok(cjkEntry.id.startsWith('~'), `encoded directory segment is the reported slot id (got ${cjkEntry.id})`)
   } finally {
     rmSync(dir, { recursive: true, force: true })
+    await unmount()
   }
 })
 
-test('F5: invalid UTF-8 and truncated skippable tails refuse; budgets refuse oversized expansion', async () => {
-  const { readSessionFile } = await import('../lib/inspect-sessions.js')
-  const { splitZstdFrames } = await import('../lib/archive/zstd-frames.js')
-  const header = Buffer.from(JSON.stringify({ type: 'session', version: 4, id: 'x', createdAt: 1, cwd: '/w', isSeeded: false, delegationDepth: 0 }) + '\n')
-  // 1) raw invalid UTF-8 inside a JSON string position: fatal decode refuses
-  const badUtf8 = Buffer.concat([header, Buffer.from([0xff, 0xfe]), Buffer.from('\n')])
-  assert.throws(() => readSessionFile(badUtf8, { compressed: false }), /UTF-8/)
-  // 2) complete session + 8-byte skippable header claiming 1024 B payload:
-  //    the declared payload must be present, never skipped past EOF
-  const framed = zlib.zstdCompressSync(header)
-  const skippable = Buffer.alloc(8)
-  skippable.writeUInt32LE(0x184d2a50, 0)
-  skippable.writeUInt32LE(1024, 4)
-  assert.throws(() => splitZstdFrames(Buffer.concat([framed, skippable])), /skippable frame payload overruns/)
-  // 3) per-session expansion budget: decompressed size over budget refuses
-  assert.throws(
-    () => readSessionFile(Buffer.concat([header, header]), { compressed: false }, { maxDecompressedBytes: 10 }),
-    /budget/,
-  )
-  assert.throws(
-    () => readSessionFile(Buffer.concat([header, Buffer.from('{"t":1}\n')]), { compressed: false }, { maxRows: 0 }),
-    /budget/,
-  )
+test('F4: wrong-cwd location refuses with LEGACY_LOCATION_MISMATCH', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
+  await injectLoader()
+  const unmount = await mountLocation()
+  const dir = mkdtempSync(join(tmpdir(), 'f4-wrong-'))
+  try {
+    const v4 = Buffer.from(JSON.stringify({ type: 'session', version: 4, id: 's-loc', createdAt: 1, cwd: '/w', isSeeded: false, delegationDepth: 0 }) + '\n')
+    const gz = buildV5Archive([
+      // the header says cwd=/w (→ '--w--') but the archive parks it elsewhere
+      fileEntry('sessions', `--wrong-project--/s-loc/session.v4.jsonl`, v4, 'sessions'),
+    ])
+    const backup = join(dir, 'b.gz')
+    writeFileSync(backup, gz)
+    const r = await inspectSessions(backup, { stagingRoot: join(dir, 'staging') })
+    const s = r.sessions[0]
+    assert.equal(s.status, 'refused')
+    assert.equal(s.code, 'LEGACY_LOCATION_MISMATCH')
+    assert.equal(s.importable, undefined)
+    assert.equal(r.counts.importable, 0)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+    await unmount()
+  }
 })
 
 test('F6: excluded names are never staged; credential/bridge roots and local paths never reach the report', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
   await injectLoader()
+  const unmount = await mountLocation()
   const codec = await v3codec()
   const dir = mkdtempSync(join(tmpdir(), 'f6-excl-'))
   try {
@@ -347,8 +475,8 @@ test('F6: excluded names are never staged; credential/bridge roots and local pat
     // Root IDs must match the payload; NAMES are free — exactly the metadata
     // surface the report must sanitize.
     const gz = buildV5Archive([
-      fileEntry('sessions', 'proj/s-ok/session.v3.jsonl', v3SessionBytes(codec, 's-ok'), 'sessions'),
-      fileEntry('sessions', 'proj/s-ok/session.lock', Buffer.from('{}'), 'sessions'),
+      fileEntry('sessions', `${officialDirFor('s-ok')}/session.v3.jsonl`, v3SessionBytes(codec, 's-ok'), 'sessions'),
+      fileEntry('sessions', `${officialDirFor('s-ok')}/session.lock`, Buffer.from('{}'), 'sessions'),
       fileEntry('settings', 'generic-settings-file.txt', Buffer.from('x'), 'settings'),
     ], {
       manifest: {
@@ -378,39 +506,87 @@ test('F6: excluded names are never staged; credential/bridge roots and local pat
     assert.equal(r.archive.manifest.roots.excludedSensitive, 1)
   } finally {
     rmSync(dir, { recursive: true, force: true })
+    await unmount()
   }
 })
 
-test('F3: CLI child process removes its staging root — success AND failure paths (exit-after-cleanup)', async () => {
+test('F6: damaged-row content markers never reach the report', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
+  await injectLoader()
+  const unmount = await mountLocation()
+  const dir = mkdtempSync(join(tmpdir(), 'f6-leak-'))
+  try {
+    const badRow = Buffer.from(JSON.stringify({ type: 'session', version: 4, id: 's-leak', createdAt: 1, cwd: '/w', isSeeded: false, delegationDepth: 0 }) + '\n' + '{"x": "SYNTHCHAT-PLACEHOLDER" broken\n')
+    const gz = buildV5Archive([
+      fileEntry('sessions', `${officialDirFor('s-leak')}/session.v4.jsonl`, badRow, 'sessions'),
+    ])
+    const backup = join(dir, 'b.gz')
+    writeFileSync(backup, gz)
+    const r = await inspectSessions(backup, { stagingRoot: join(dir, 'staging') })
+    assert.equal(r.sessions[0].status, 'refused')
+    assert.equal(r.sessions[0].code, 'SESSION_ROW_MALFORMED')
+    assert.ok(!JSON.stringify(r).includes('SYNTHCHAT-PLACEHOLDER'), 'the damaged row content must not leak into any report field')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+    await unmount()
+  }
+})
+
+test('F3: CLI staging root is a CONTAINER — job subdirectory removed, sentinel untouched, root verified gone after child exit', async () => {
   const { spawnSync } = await import('node:child_process')
   const dir = mkdtempSync(join(tmpdir(), 'f3-cli-'))
   try {
     const okBackup = join(dir, 'ok.gz')
     writeFileSync(okBackup, buildV5Archive([
-      fileEntry('sessions', 'proj/s-ok/session.v3.jsonl', Buffer.from(JSON.stringify({ type: 'session', version: 3, id: 's-ok', createdAt: 1, cwd: '/w', isSeeded: false, delegationDepth: 0 }) + '\n'), 'sessions'),
+      fileEntry('sessions', `${officialDirFor('s-ok')}/session.v3.jsonl`, headerRow(3, 's-ok'), 'sessions'),
     ]))
     const badBackup = join(dir, 'bad.gz')
     const badGz = buildV5Archive([fileEntry('sessions', 'proj/s1/session.v4.jsonl', text('abc'))])
     badGz[badGz.length - 700] ^= 0xff
     writeFileSync(badBackup, badGz)
     const cli = join(import.meta.dirname, '..', 'bin', 'inspect.mjs')
-    for (const [label, backup, stagingRoot, expectedExit] of [
-      ['success', okBackup, join(dir, 'stg-ok'), 0],
-      ['failure', badBackup, join(dir, 'stg-bad'), 1],
+    for (const [label, backup, container, expectedExit] of [
+      ['success', okBackup, join(dir, 'cont-ok'), 0],
+      ['failure', badBackup, join(dir, 'cont-bad'), 1],
     ]) {
-      const res = spawnSync(process.execPath, [cli, backup, '--staging-root', stagingRoot], { encoding: 'utf8', timeout: 60_000 })
+      // a PRE-EXISTING sentinel in the container simulates the caller's own
+      // object; a failed (or successful) job must never delete it.
+      const sentinel = join(container, 'sentinel.txt')
+      mkdirSync(container, { recursive: true })
+      writeFileSync(sentinel, 'caller-owned')
+      const res = spawnSync(process.execPath, [cli, backup, '--staging-root', container], { encoding: 'utf8', timeout: 60_000 })
       assert.equal(res.status, expectedExit, `${label}: exit ${res.status} (stderr: ${String(res.stderr).slice(0, 200)})`)
       const out = JSON.parse(res.stdout)
       assert.equal(out.staging.cleanedUp, true, `${label}: receipt must claim cleanup only after verified removal`)
       assert.ok(!out.staging.cleanupError, `${label}: ${out.staging.cleanupError ?? ''}`)
-      assert.equal(existsSync(stagingRoot), false, `${label}: staging root must NOT exist after the child exited`)
-      // robust path-leak check: the staging dir's unique segment must not
-      // appear in ANY form (JSON escaping would hide raw-backslash matches).
-      // (The backup path legitimately appears — the caller passed it in.)
-      const stagingSegment = label === 'success' ? 'stg-ok' : 'stg-bad'
+      assert.equal(existsSync(sentinel), true, `${label}: the caller's sentinel must survive the job`)
+      const leftover = existsSync(container) ? readdirSync(container).filter(n => n.startsWith('job-')) : ['container-missing']
+      assert.equal(leftover.length, 0, `${label}: the job subdirectory must be gone after exit (left: ${leftover})`)
+      const stagingSegment = label === 'success' ? 'cont-ok' : 'cont-bad'
       assert.ok(!JSON.stringify(out).includes(stagingSegment), `${label}: report must not contain the staging root path`)
     }
   } finally {
     rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('R3: real backup passes through the unified entry (env-gated)', { skip: !process.env.DSHA_V5_REAL || skip ? 'DSHA_V5_REAL or RC4_MODULES not set' : false }, async () => {
+  await injectLoader()
+  const unmount = await mountLocation()
+  const dir = mkdtempSync(join(tmpdir(), 'r3-real-'))
+  try {
+    const stagingRoot = join(dir, 'staging')
+    const r = await inspectSessions(process.env.DSHA_V5_REAL, { stagingRoot })
+    assert.equal(r.archiveFailed, undefined)
+    assert.equal(r.counts.total, 2)
+    assert.equal(r.counts.importable, 2, `sessions must be FULLY admitted (official location verified); got ${JSON.stringify(r.sessions.map(s => ({ id: s.id, status: s.status, binding: s.binding, err: s.error })))}`)
+    for (const s of r.sessions) {
+      assert.equal(s.status, 'restored')
+      assert.equal(s.sourceGeneration, 4)
+      assert.equal(s.locationVerified, true)
+      assert.ok([596, 454].includes(s.events), `event count ${s.events}`)
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+    await unmount()
   }
 })

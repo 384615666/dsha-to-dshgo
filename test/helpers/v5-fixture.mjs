@@ -102,9 +102,17 @@ export function buildV5Archive(entries, options = {}) {
   return zlib.gzipSync(tar, { level: 1 })
 }
 
-export function fileEntry(root, path, payload, scope = 'plugins') {
+export function fileEntry(root, path, payload, scope = 'plugins', metaOverride = {}) {
   return {
-    meta: { root, path, kind: 'FILE', scope, size: payload.length, sha256: createHash('sha256').update(payload).digest('hex'), mode: 384 },
+    meta: { root, path, kind: 'FILE', scope, size: payload.length, sha256: createHash('sha256').update(payload).digest('hex'), mode: 384, ...metaOverride },
     payload,
+  }
+}
+
+/** A declared-but-missing slot (non-FILE record: size 0, empty digest). */
+export function missingEntry(root, path, scope = 'plugins') {
+  return {
+    meta: { root, path, kind: 'MISSING', scope, size: 0, sha256: '' },
+    payload: Buffer.alloc(0),
   }
 }

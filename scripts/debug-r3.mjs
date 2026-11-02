@@ -23,21 +23,21 @@ const mk = (t, id) => Buffer.from(JSON.stringify({
 
 const dir = mkdtempSync(join(tmpdir(), 'dbg11-'))
 const gz = buildV5Archive([
-  fileEntry('sessions', 'proj/s-v4/session.v4.jsonl.zstd', zlib.zstdCompressSync(mk(4, 's-v4')), 'sessions'),
-  fileEntry('sessions', 'proj/s-v0/session.jsonl', mk(0, 's-v0'), 'sessions'),
+  fileEntry('sessions', '--w--/s-v4/session.v4.jsonl.zstd', zlib.zstdCompressSync(mk(4, 's-v4')), 'sessions'),
+  fileEntry('sessions', '--w--/s-v0/session.jsonl', mk(0, 's-v0'), 'sessions'),
   // Highest generation wins; v3 discarded without restore.
-  fileEntry('sessions', 'proj/s-mix/session.v3.jsonl', mk(3, 's-mix'), 'sessions'),
-  fileEntry('sessions', 'proj/s-mix/session.v4.jsonl', mk(4, 's-mix'), 'sessions'),
+  fileEntry('sessions', '--w--/s-mix/session.v3.jsonl', mk(3, 's-mix'), 'sessions'),
+  fileEntry('sessions', '--w--/s-mix/session.v4.jsonl', mk(4, 's-mix'), 'sessions'),
   // v3-only: exercises the historical → child-bound routing to reach v4.
-  fileEntry('sessions', 'proj/s-v3only/session.v3.jsonl', mk(3, 's-v3only'), 'sessions'),
+  fileEntry('sessions', '--w--/s-v3only/session.v3.jsonl', mk(3, 's-v3only'), 'sessions'),
   // Same-generation twins (plain + zstd) → ambiguous, isolated.
-  fileEntry('sessions', 'proj/s-amb/session.v4.jsonl', mk(4, 's-amb'), 'sessions'),
-  fileEntry('sessions', 'proj/s-amb/session.v4.jsonl.zstd', zlib.zstdCompressSync(mk(4, 's-amb')), 'sessions'),
+  fileEntry('sessions', '--w--/s-amb/session.v4.jsonl', mk(4, 's-amb'), 'sessions'),
+  fileEntry('sessions', '--w--/s-amb/session.v4.jsonl.zstd', zlib.zstdCompressSync(mk(4, 's-amb')), 'sessions'),
   // Corrupt highest: garbage zstd bytes → refused, must NOT fall back to v3.
-  fileEntry('sessions', 'proj/s-corrupt/session.v4.jsonl.zstd', Buffer.from('not-zstd-at-all'), 'sessions'),
-  fileEntry('sessions', 'proj/s-corrupt/session.v3.jsonl', mk(3, 's-corrupt'), 'sessions'),
+  fileEntry('sessions', '--w--/s-corrupt/session.v4.jsonl.zstd', Buffer.from('not-zstd-at-all'), 'sessions'),
+  fileEntry('sessions', '--w--/s-corrupt/session.v3.jsonl', mk(3, 's-corrupt'), 'sessions'),
   // Header id disagrees with the directory name → binding refusal.
-  fileEntry('sessions', 'proj/s-wrong/session.v4.jsonl', mk(4, 's-elsewhere'), 'sessions'),
+  fileEntry('sessions', '--w--/s-wrong/session.v4.jsonl', mk(4, 's-elsewhere'), 'sessions'),
 ])
 const backup = join(dir, 'b.gz')
 writeFileSync(backup, gz)

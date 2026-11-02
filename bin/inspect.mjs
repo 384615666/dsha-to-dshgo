@@ -130,6 +130,11 @@ async function runSessions() {
   const tool = { tool: 'dsh-dsha-migrator inspect', at: new Date().toISOString(), file, mode: 'sessions' }
   // Outside the host, RC4_MODULES points at a node_modules holding the
   // official 0.2.1-rc.4 packages; inside the host the bare names resolve.
+  // The official location adapter is mounted from the SAME node_modules when
+  // the official JSONL persistence backend is present: the authoritative
+  // session directory for a header comes from the backend's OWN locate()
+  // (mounted on an isolated throwaway root), never from copied encoders.
+  let disposeLocation = null
   if (process.env.RC4_MODULES) {
     const { createRequire } = await import('node:module')
     const { pathToFileURL } = await import('node:url')
@@ -139,11 +144,40 @@ async function runSessions() {
       cat: await import(pathToFileURL(req.resolve('@deepseek-ai/dsh-session-format-catalog')).href),
       v3: await import(pathToFileURL(req.resolve('@deepseek-ai/dsh-session-format-v3-to-v4')).href),
     }))
+    try {
+      const jsonl = await import(pathToFileURL(req.resolve('@deepseek-ai/dsh-session-persistence-jsonl')).href)
+      const cordisUrl = pathToFileURL(req.resolve('@deepseek-ai/cordis')).href
+      const { Context } = await import(cordisUrl)
+      const { relative } = await import('node:path')
+      const { sep } = await import('node:path')
+      const backendRoot = mkdtempSync(join(tmpdir(), 'dsha-locate-root-'))
+      const ctx = new Context()
+      await ctx.plugin(jsonl, { root: backendRoot, compression: 'zstd' })
+      const store = ctx.sessionPersistence
+      if (typeof store?.locate !== 'function') throw new Error('official backend locate unavailable')
+      const { setLocationAdapter } = await import('../lib/migration/location.js')
+      await setLocationAdapter(header => {
+        const loc = store.locate({ cwd: header.cwd, id: header.id })
+        return relative(backendRoot, loc.path).split(sep).slice(0, -1).join('/')
+      })
+      disposeLocation = async () => {
+        await setLocationAdapter(null)
+        try { await ctx.fiber?.dispose?.() } catch { /* best effort */ }
+        rmSync(backendRoot, { recursive: true, force: true })
+      }
+    } catch {
+      // Location adapter unavailable: sessions will be admitted as
+      // location-unverified and NOT importable (honest downgrade).
+      disposeLocation = null
+    }
   }
-  // The staging root is created here (temp) or taken from --staging-root so
-  // acceptance tests can verify its removal after this process exits.
-  const ownsStaging = !explicitStagingRoot
-  const stagingRoot = explicitStagingRoot ?? mkdtempSync(join(tmpdir(), 'dsha-inspect-'))
+  // OWNERSHIP: --staging-root is a CONTAINER, not a job directory. The job's
+  // staging area is a unique subdirectory created inside it; ONLY that
+  // subdirectory is ever removed. Pre-existing files in the container (the
+  // caller's own objects) can never be deleted by a failed or successful run.
+  const stagingRoot = explicitStagingRoot
+    ? mkdtempSync(join(explicitStagingRoot, 'job-'))
+    : mkdtempSync(join(tmpdir(), 'dsha-inspect-'))
   let payload = null
   let exitCode = 0
   try {
@@ -152,6 +186,7 @@ async function runSessions() {
       ...tool,
       durationMs: Date.now() - started,
       archiveVerified: !report.archiveFailed,
+      locationAdmission: report.locationAdmission,
       archive: report.archive,
       ambiguous: report.ambiguous,
       childEvidence: report.childEvidence,
@@ -166,10 +201,10 @@ async function runSessions() {
     payload = { ...tool, durationMs: Date.now() - started, verified: false, error: { message: error.message, code: error.code ?? null } }
     exitCode = 1
   }
-  // Cleanup FIRST, verify the removal, then emit the receipt — the receipt
-  // must describe what actually happened, never a hardcoded true, and must
-  // NOT echo the local staging path.
-  let cleanup = { cleanedUp: false, removedRoot: ownsStaging ? '<temp>' : 'caller-provided' }
+  // Cleanup FIRST (this job's directory ONLY), verify the removal, then emit
+  // the receipt — the receipt must describe what actually happened, never a
+  // hardcoded true, and must NOT echo the local staging path.
+  let cleanup = { cleanedUp: false, removedRoot: explicitStagingRoot ? 'container/job-*' : '<temp>' }
   try {
     rmSync(stagingRoot, { recursive: true, force: true })
   } catch (error) {
@@ -179,6 +214,7 @@ async function runSessions() {
   if (!cleanup.cleanedUp && !cleanup.cleanupError) {
     cleanup.cleanupError = 'staging root still exists after rmSync'
   }
+  if (disposeLocation) await disposeLocation()
   // Sanitized staging summary is part of the payload (no absolute paths);
   // the cleanup receipt is appended after verified removal.
   console.log(JSON.stringify({ ...payload, staging: cleanup }, null, 2))
