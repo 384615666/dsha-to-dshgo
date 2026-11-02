@@ -5,12 +5,12 @@
 // through the adapter's test seam.
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, mkdirSync, rmSync, existsSync, readdirSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, rmSync, existsSync, readdirSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, relative, sep } from 'node:path'
 import { createRequire } from 'node:module'
 import { pathToFileURL } from 'node:url'
-import { createJsonlWithdrawalAdapter } from '../lib/import/withdraw.js'
+import { createJsonlWithdrawalAdapter, quarantineNameFor } from '../lib/import/withdraw.js'
 import { ImportJournal } from '../lib/import/journal.js'
 import { captureTargetPreState, rollbackBatch } from '../lib/import/g6.js'
 
@@ -145,7 +145,7 @@ test('P2 W4: a competing writer cannot enter during the protected withdrawal —
     assert.match(competingRefused ?? '', /SessionAlreadyOwned/, `the competing open must be refused while the lease is held (got ${competingRefused})`)
     assert.equal(rb.outcome, 'complete', JSON.stringify({ conflicts: rb.conflicts, failures: rb.failures, diffs: rb.verification.diffs }))
     assert.equal(await t.persistence.stat('w4-s'), undefined, 'session withdrawn from the active namespace')
-    const quarantined = join(jobDir, 'quarantine', 'session-w4-s')
+    const quarantined = join(jobDir, 'quarantine', quarantineNameFor('w4-s'))
     assert.ok(existsSync(quarantined), 'payload kept recoverable in quarantine')
   } finally {
     await t.unmount()
@@ -181,7 +181,7 @@ test('P2 W4: content that changed before the lease was acquired is NOT withdrawn
     assert.equal(rb.outcome, 'pending')
     assert.ok(rb.conflicts.some(c => /changed after our write|revision changed/.test(c.reason)), JSON.stringify(rb.conflicts))
     assert.ok(await t.persistence.stat('w4-r'), 'the session stays visible')
-    assert.ok(!existsSync(join(jobDir, 'quarantine', 'session-w4-r')), 'nothing was quarantined')
+    assert.ok(!existsSync(join(jobDir, 'quarantine', quarantineNameFor('w4-r'))), 'nothing was quarantined')
     void candidate
   } finally {
     await t.unmount()
@@ -194,7 +194,7 @@ test('P2 W4: the adapter refuses to overwrite an existing quarantined payload', 
   const jobDir = mkdtempSync(join(tmpdir(), 'w4-dup-'))
   try {
     const { journal, snapshot, candidate, imported } = await prepareBatch(t, jobDir, 'w4-d')
-    mkdirSync(join(jobDir, 'quarantine', 'session-w4-d'), { recursive: true })
+    mkdirSync(join(jobDir, 'quarantine', quarantineNameFor('w4-d')), { recursive: true })
     const withdraw = createJsonlWithdrawalAdapter({
       persistence: t.persistence,
       sessionsRoot: t.sessionsRoot,
@@ -215,6 +215,81 @@ test('P2 W4: the adapter refuses to overwrite an existing quarantined payload', 
     assert.ok(await t.persistence.stat('w4-d'), 'the session must not be moved on an ambiguous quarantine state')
     void candidate
     void imported
+  } finally {
+    await t.unmount()
+    rmSync(jobDir, { recursive: true, force: true })
+  }
+})
+
+test('P2 F1: quarantine names never derive from the raw session id — slash / traversal / CJK ids stay inside quarantine', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
+  const t = await mountTarget()
+  const jobDir = mkdtempSync(join(tmpdir(), 'f1-paths-'))
+  const quarantineRoot = join(jobDir, 'quarantine')
+  try {
+    const { importSessionViaA } = await import('../lib/import/writer-a.js')
+    const ids = ['plain-id', 'ordinary/slash', 'nested/../../escaped-quarantine', '会话-id']
+    const results = []
+    for (const id of ids) {
+      const candidate = await canonicalCandidate(id, t.base)
+      const imported = await importSessionViaA(t.persistence, candidate)
+      const withdraw = createJsonlWithdrawalAdapter({
+        persistence: t.persistence,
+        sessionsRoot: t.sessionsRoot,
+        locateDir: h => t.locateDir(h),
+        quarantineRoot,
+      })
+      const res = await withdraw(id, { expectedRevision: imported.revision, cwd: candidate.header.cwd })
+      const name = quarantineNameFor(id)
+      const dest = join(quarantineRoot, name)
+      assert.equal(res.quarantinedTo, dest)
+      assert.ok(existsSync(dest), `payload for ${id} quarantined under its digest name`)
+      assert.ok(!res.quarantinedTo.includes('/'), 'quarantine target is a single segment')
+      // ownership record carries the raw id in a SEMANTIC field
+      const owner = JSON.parse(readFileSync(join(quarantineRoot, `${name}.owner.json`), 'utf8'))
+      assert.equal(owner.sourceId, id)
+      assert.equal(await t.persistence.stat(id), undefined, `${id} withdrawn from the active namespace`)
+      results.push({ id, name, dest })
+    }
+    // nothing may exist outside the quarantine root because of these ids
+    const parentEntries = readdirSync(jobDir)
+    assert.ok(!parentEntries.includes('escaped-quarantine'), 'a traversal id must never create an object next to the quarantine root')
+    assert.ok(!parentEntries.includes('slash'), 'a slash id must never create nested directories outside')
+    assert.equal(readdirSync(quarantineRoot).filter(n => !n.endsWith('.owner.json')).length, ids.length)
+    void results
+  } finally {
+    await t.unmount()
+    rmSync(jobDir, { recursive: true, force: true })
+  }
+})
+
+test('P2 F1: an escaping locate result and the sessions root itself are refused before any move', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
+  const t = await mountTarget()
+  const jobDir = mkdtempSync(join(tmpdir(), 'f1-src-'))
+  try {
+    const { importSessionViaA } = await import('../lib/import/writer-a.js')
+    const candidate = await canonicalCandidate('f1-src', t.base)
+    const imported = await importSessionViaA(t.persistence, candidate)
+    const escaping = createJsonlWithdrawalAdapter({
+      persistence: t.persistence,
+      sessionsRoot: t.sessionsRoot,
+      locateDir: () => '../outside-the-root',
+      quarantineRoot: join(jobDir, 'quarantine'),
+    })
+    await assert.rejects(
+      () => escaping('f1-src', { expectedRevision: imported.revision, cwd: candidate.header.cwd }),
+      err => err.code === 'WITHDRAW_UNSAFE_PATH',
+    )
+    const rootItself = createJsonlWithdrawalAdapter({
+      persistence: t.persistence,
+      sessionsRoot: t.sessionsRoot,
+      locateDir: () => '.',
+      quarantineRoot: join(jobDir, 'quarantine'),
+    })
+    await assert.rejects(
+      () => rootItself('f1-src', { expectedRevision: imported.revision, cwd: candidate.header.cwd }),
+      err => err.code === 'WITHDRAW_UNSAFE_PATH',
+    )
+    assert.ok(await t.persistence.stat('f1-src'), 'refusals never move the session')
   } finally {
     await t.unmount()
     rmSync(jobDir, { recursive: true, force: true })

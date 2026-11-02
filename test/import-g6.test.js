@@ -200,6 +200,7 @@ test('P2 G6: full flow with intents/outcomes, reverse rollback, fresh-instance v
       persistence: t.persistence,
       withdrawSession,
       journal,
+      allowUnprotected: true,
     })
     assert.equal(rb.outcome, 'complete', `clean rollback must complete: ${JSON.stringify({ conflicts: rb.conflicts, failures: rb.failures, diffs: rb.verification.diffs })}`)
     assert.ok(rb.compensated.some(c => c.startsWith('session.attach:g6-s1')))
@@ -337,6 +338,7 @@ test('P2 G6 §4b/§4c: withdrawal withheld for user-appended sessions; wrong-own
       persistence: t.persistence,
       withdrawSession: async (id) => { withdrawCalls += 1 },
       journal,
+      allowUnprotected: true,
     })
     assert.equal(rb.outcome, 'pending', `both conflicts must yield pending (got ${rb.outcome})`)
     assert.equal(withdrawCalls, 0, 'no session may be withdrawn under ownership/revision conflicts')
@@ -556,6 +558,7 @@ test('P2 R2: DONE requires committed sessions, no open intents and recorded veri
       persistence: fakePersistence,
       withdrawSession: async () => { const e = new Error('injected withdraw EIO'); e.code = 'EIO'; throw e },
       journal: j2,
+      allowUnprotected: true,
     })
     assert.equal(rb.outcome, 'failed')
     assert.equal(j2.state.batchState, 'ROLLBACK_PENDING', 'a failed compensation stays resumable')
@@ -702,6 +705,7 @@ test('P2 R5: an active write owner blocks withdrawal even when the revision is u
       persistence: t.persistence,
       withdrawSession: async () => { withdrawCalls += 1 },
       journal,
+      allowUnprotected: true,
     })
     assert.equal(rb.outcome, 'pending', `an active owner must yield pending (got ${rb.outcome})`)
     assert.equal(withdrawCalls, 0, 'withdrawal must not run while a write owner holds the session')
@@ -717,6 +721,7 @@ test('P2 R5: an active write owner blocks withdrawal even when the revision is u
       persistence: t.persistence,
       withdrawSession: async id => { withdrawCalls += 1; const dir = t.locateDir({ cwd: s.header.cwd, id }); rmSync(join(t.sessionsRoot, dir), { recursive: true, force: true }) },
       journal,
+      allowUnprotected: true,
     })
     assert.equal(rb2.outcome, 'complete', JSON.stringify({ conflicts: rb2.conflicts, diffs: rb2.verification.diffs }))
     assert.equal(withdrawCalls, 1)
@@ -924,3 +929,18 @@ function cpSync(from, to, _opts) {
     else fs.copyFileSync(src, dst)
   }
 }
+
+test('P2 fallback policy: an UNPROTECTED withdrawal adapter is refused by default (isolated labs opt in explicitly)', async () => {
+  const snapshot = { workspaces: [], workspaceIds: [], archivedSessionIds: [], pinnedSessionIds: [], sessions: { x: { exists: false } }, ownership: { plannedCreates: [{ id: 'x', preExisting: false }] } }
+  const actions = [{ seq: 1, stage: 'done', type: 'session.import', sessionId: 'x', outcome: { revision: 'r1' } }]
+  const persistence = { stat: async () => ({ revision: 'r1' }), open: async () => ({ close: async () => {} }) }
+  let calls = 0
+  const plain = async () => { calls += 1 }
+  const refused = await rollbackBatch({ actions, snapshot, plannedSessionIds: ['x'], persistence, withdrawSession: plain })
+  assert.equal(calls, 0, 'production mode must not call an unprotected adapter')
+  assert.ok(refused.conflicts.some(c => /unprotected withdrawal adapter/.test(c.reason)), JSON.stringify(refused.conflicts))
+  // explicit isolated-lab opt-in keeps the probe path available
+  const lab = await rollbackBatch({ actions, snapshot, plannedSessionIds: ['x'], persistence, withdrawSession: plain, allowUnprotected: true })
+  assert.equal(calls, 1)
+  void lab
+})
