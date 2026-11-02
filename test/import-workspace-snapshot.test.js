@@ -113,3 +113,106 @@ test('P2 workspace snapshot: full entity fields + verified disk copy of the stor
     rmSync(jobDir, { recursive: true, force: true })
   }
 })
+
+test('P2 workspace snapshot: a state change DURING capture is retried — no mixed pre-state is published', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
+  const t = await mountTarget()
+  const jobDir = mkdtempSync(join(tmpdir(), 'ws-stable-'))
+  try {
+    const wdir = join(t.base, 'w2')
+    mkdirSync(wdir, { recursive: true })
+    const W = await t.workspaceRegistry.create(wdir, 'before-capture-title')
+    let mutated = false
+    const provider = async () => {
+      if (!mutated) {
+        mutated = true
+        await W.setTitle('during-capture-user-title')
+      }
+      return { bytes: readFileSync(join(t.storageRoot, 'workspace.json')) }
+    }
+    const snapshot = await captureTargetPreState({
+      persistence: t.persistence,
+      workspaceRegistry: t.workspaceRegistry,
+      plannedSessionIds: ['ws-new-2'],
+      workspaceUnitProvider: provider,
+      snapshotDir: jobDir,
+    })
+    // The accepted snapshot is internally consistent: entity fields and the
+    // disk copy are both the POST-change state.
+    const entity = snapshot.workspaces.find(w => w.id === W.id)
+    assert.equal(entity.title, 'during-capture-user-title', 'the entity view must come from the same moment as the copy')
+    const copy = readFileSync(join(jobDir, snapshot.workspaceUnit.file))
+    assert.equal(snapshot.workspaceUnit.digest, (await import('node:crypto')).createHash('sha256').update(copy).digest('hex'))
+    assert.equal(computeSnapshotDigest(snapshot), snapshot.digest)
+    // A journal admits it (intact copy)
+    const journal = ImportJournal.init(join(jobDir, 'j.json'), { instanceFingerprint: 'inst-s', sourceDigest: 'src-s' })
+    journal.transitionBatch('PLANNED')
+    journal.setSnapshot(snapshot)
+    journal.transitionBatch('SNAPSHOT_READY')
+    journal.transitionBatch('IMPORTING')
+  } finally {
+    await t.unmount()
+    rmSync(jobDir, { recursive: true, force: true })
+  }
+})
+
+test('P2 workspace snapshot: a never-stable target is refused with G6_SNAPSHOT_UNSTABLE', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
+  const t = await mountTarget()
+  const jobDir = mkdtempSync(join(tmpdir(), 'ws-unstable-'))
+  try {
+    const wdir = join(t.base, 'w3')
+    mkdirSync(wdir, { recursive: true })
+    const W = await t.workspaceRegistry.create(wdir, 'unstable-0')
+    let n = 0
+    const provider = async () => {
+      n += 1
+      await W.setTitle(`unstable-${n}`)
+      return { bytes: readFileSync(join(t.storageRoot, 'workspace.json')) }
+    }
+    await assert.rejects(
+      () => captureTargetPreState({
+        persistence: t.persistence,
+        workspaceRegistry: t.workspaceRegistry,
+        plannedSessionIds: ['ws-new-3'],
+        workspaceUnitProvider: provider,
+        snapshotDir: jobDir,
+        captureAttempts: 3,
+        captureRetryDelayMs: 1,
+      }),
+      err => err.code === 'G6_SNAPSHOT_UNSTABLE',
+    )
+  } finally {
+    await t.unmount()
+    rmSync(jobDir, { recursive: true, force: true })
+  }
+})
+
+test('P2 workspace snapshot: a file fsync failure aborts capture — no admission without a durable backup', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
+  const t = await mountTarget()
+  const jobDir = mkdtempSync(join(tmpdir(), 'ws-fsync-'))
+  try {
+    const wdir = join(t.base, 'w4')
+    mkdirSync(wdir, { recursive: true })
+    await t.workspaceRegistry.create(wdir, 'durable')
+    const fsmod = (await import('node:fs')).default
+    const real = fsmod.fsyncSync
+    fsmod.fsyncSync = () => { const e = new Error('injected EIO'); e.code = 'EIO'; throw e }
+    try {
+      await assert.rejects(
+        () => captureTargetPreState({
+          persistence: t.persistence,
+          workspaceRegistry: t.workspaceRegistry,
+          plannedSessionIds: ['ws-new-4'],
+          workspaceUnitProvider: t.unitProvider,
+          snapshotDir: jobDir,
+        }),
+        err => err.code === 'G6_SNAPSHOT_IO',
+      )
+    } finally {
+      fsmod.fsyncSync = real
+    }
+    assert.ok(!existsSync(join(jobDir, 'workspace-unit.json')), 'no published copy after a failed fsync')
+  } finally {
+    await t.unmount()
+    rmSync(jobDir, { recursive: true, force: true })
+  }
+})
