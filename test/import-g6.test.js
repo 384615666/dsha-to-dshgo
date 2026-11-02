@@ -148,9 +148,9 @@ test('P2 G6: full flow with intents/outcomes, reverse rollback, fresh-instance v
     const tampered = JSON.parse(readFileSync(journal.file, 'utf8'))
     tampered.snapshot.workspaces = []
     writeFileSync(journal.file, JSON.stringify(tampered))
-    const fromDisk = ImportJournal.load(journal.file, binding)
-    assert.throws(() => fromDisk.transitionBatch('IMPORTING'), /does not match its digest/, 'a tampered snapshot must refuse IMPORTING')
-    // restore the correct snapshot (original journal still holds it) and proceed
+    // A tampered snapshot now refuses at LOAD (full disk validation).
+    assert.throws(() => ImportJournal.load(journal.file, binding), /does not match its digest/, 'a tampered snapshot must refuse to load')
+    // restore the correct snapshot (in-process journal still holds it) and proceed
     journal.setSnapshot(snapshot)
     journal.transitionBatch('IMPORTING')
 
@@ -388,6 +388,10 @@ test('P2 journal §1/§2/§3: init/load separation, fsync EIO aborts, snapshot g
     const onDiskAfterLoads = JSON.parse(readFileSync(file, 'utf8'))
     assert.equal(onDiskAfterLoads.batchState, 'SNAPSHOT_READY')
     assert.equal(onDiskAfterLoads.actions.length, 1)
+    // A restored NON-TERMINAL record must pass an explicit recovery check
+    // before any mutation (conservative admission independent of any seal).
+    assert.throws(() => l2.transitionBatch('IMPORTING'), err => err.code === 'JOURNAL_RECOVERY_REQUIRED')
+    l2.acknowledgeRecovery()
 
     // §3 snapshot gate first: IMPORTING requires a persisted,
     // digest-verified snapshot.
@@ -415,6 +419,7 @@ test('P2 journal §1/§2/§3: init/load separation, fsync EIO aborts, snapshot g
     const afterEio = ImportJournal.load(file, binding)
     assert.equal(afterEio.state.batchState, 'SNAPSHOT_READY', 'the disk keeps the previous valid record')
     assert.equal(afterEio.state.actions.length, 1, 'actions survive a failed persistence attempt')
+    afterEio.acknowledgeRecovery()
     afterEio.transitionBatch('IMPORTING')
 
     // §3: commit gates — session evidence, batch state, open intents.
@@ -718,6 +723,192 @@ test('P2 R5: an active write owner blocks withdrawal even when the revision is u
   } finally {
     await t.unmount()
     rmSync(jobDir, { recursive: true, force: true })
+  }
+})
+
+// ---------------------------------------------------------------------------
+// W1–W3 (p2-46eb1a6 review).
+// ---------------------------------------------------------------------------
+
+test('P2 W1: a NEW PROCESS refuses to advance a restored non-terminal journal — even when the seal write itself failed (double EIO); ack validates the full binding', async () => {
+  const jobDir = mkdtempSync(join(tmpdir(), 'w1-seal-'))
+  try {
+    const file = join(jobDir, 'j.json')
+    const binding = { instanceFingerprint: 'inst-w1', sourceDigest: 'src-w1' }
+    const j = ImportJournal.init(file, binding)
+    j.transitionBatch('PLANNED')
+    const realFsync = fs.fsyncSync
+    let fsyncCalls = 0
+    // Ordering per the review: content fsync OK + rename OK; directory fsync
+    // EIO; then the SEAL record's own file fsync fails too (its rename never
+    // happens) — the disk keeps the new record with NO seal marker.
+    fs.fsyncSync = fd => {
+      fsyncCalls += 1
+      if (fsyncCalls === 2 || fsyncCalls >= 3) { const e = new Error('injected EIO'); e.code = 'EIO'; throw e }
+      return realFsync(fd)
+    }
+    let caught = null
+    try { j.transitionBatch('SNAPSHOT_READY') } catch (error) { caught = error } finally { fs.fsyncSync = realFsync }
+    assert.equal(caught?.code, 'JOURNAL_DURABILITY_UNKNOWN')
+    const raw = JSON.parse(readFileSync(file, 'utf8'))
+    assert.equal(raw.batchState, 'SNAPSHOT_READY')
+    assert.equal(raw.durabilityUnknown, undefined, 'the seal write failed — no marker on disk (the hard case)')
+
+    // A REAL new process must still refuse to advance: the recovery
+    // requirement comes from the durable state, not from the failed marker.
+    const libUrl = pathToFileURL(join(import.meta.dirname, '..', 'lib', 'import', 'journal.js')).href
+    const script = `
+      const { ImportJournal } = await import(${JSON.stringify(libUrl)});
+      const j = ImportJournal.load(${JSON.stringify(file)}, ${JSON.stringify(binding)});
+      let code = null;
+      try { j.transitionBatch('FAILED'); } catch (e) { code = e.code; }
+      process.stdout.write(JSON.stringify({ loadedState: j.state.batchState, refusedWith: code }));
+    `
+    const { spawnSync } = await import('node:child_process')
+    const res = spawnSync(process.execPath, ['--input-type=module', '-e', script], { encoding: 'utf8', timeout: 60_000 })
+    assert.equal(res.status, 0, String(res.stderr).slice(0, 300))
+    const child = JSON.parse(res.stdout)
+    assert.equal(child.loadedState, 'SNAPSHOT_READY')
+    assert.equal(child.refusedWith, 'JOURNAL_RECOVERY_REQUIRED', 'a new process must not advance without a recovery check')
+
+    // ack refuses a different source digest (no rebinding through recovery).
+    const reloaded = ImportJournal.load(file, binding)
+    const swapped = JSON.parse(readFileSync(file, 'utf8'))
+    swapped.binding = { instanceFingerprint: binding.instanceFingerprint, sourceDigest: 'different-source' }
+    writeFileSync(file, JSON.stringify(swapped))
+    assert.throws(() => reloaded.acknowledgeRecovery(), err => err.code === 'JOURNAL_BINDING_MISMATCH')
+    // restore the original binding and verify the explicit ack works.
+    const original = JSON.parse(readFileSync(file, 'utf8'))
+    original.binding = binding
+    writeFileSync(file, JSON.stringify(original))
+    const ok = ImportJournal.load(file, binding)
+    ok.acknowledgeRecovery()
+    ok.transitionBatch('FAILED')
+  } finally {
+    rmSync(jobDir, { recursive: true, force: true })
+  }
+})
+
+test('P2 W2: DONE checks the COMPLETE persisted plan — a planned id with no state entry blocks DONE; explicit exclusions yield PARTIAL', async () => {
+  const jobDir = mkdtempSync(join(tmpdir(), 'w2-plan-'))
+  try {
+    const { computeSnapshotDigest } = await import('../lib/import/g6.js')
+    const binding = { instanceFingerprint: 'inst-w2', sourceDigest: 'src-w2' }
+    const make = name => {
+      const snap = {
+        workspaces: [], workspaceIds: [], archivedSessionIds: [], pinnedSessionIds: [],
+        sessions: { 'planned-a': { exists: false }, 'planned-b': { exists: false } },
+        ownership: { plannedCreates: [{ id: 'planned-a', preExisting: false }, { id: 'planned-b', preExisting: false }] },
+      }
+      snap.digest = computeSnapshotDigest(snap)
+      const j = ImportJournal.init(join(jobDir, name), binding)
+      j.transitionBatch('PLANNED')
+      j.setSnapshot(snap)
+      j.transitionBatch('SNAPSHOT_READY')
+      j.transitionBatch('IMPORTING')
+      return j
+    }
+    // evidence phases first; committing is judged in VERIFYING_TARGET
+    const verifyA = j => {
+      const seq = j.intent({ type: 'session.import', sessionId: 'planned-a' })
+      j.session('planned-a', 'writing')
+      j.session('planned-a', 'readback-verified')
+      j.confirm(seq, { revision: 'rA' })
+    }
+    const commitA = j => j.session('planned-a', 'committed', { skipReason: 'no attachment planned (verified)' })
+
+    const j1 = make('j1.json')
+    verifyA(j1)
+    j1.transitionBatch('VERIFYING_TARGET')
+    commitA(j1)
+    j1.recordVerification({ ok: true, diffs: [] })
+    assert.throws(() => j1.transitionBatch('DONE'), /planned sessions not committed: planned-b/)
+
+    j1.session('planned-b', 'writing')
+    j1.session('planned-b', 'readback-verified')
+    j1.session('planned-b', 'committed', { skipReason: 'no attachment planned (verified)' })
+    j1.transitionBatch('DONE')
+    assert.equal(j1.state.outcome, 'DONE')
+
+    const j2 = make('j2.json')
+    verifyA(j2)
+    j2.recordPartial([{ id: 'planned-b', reason: 'source child evidence unavailable (declared missing)' }])
+    j2.transitionBatch('VERIFYING_TARGET')
+    commitA(j2)
+    j2.recordVerification({ ok: true, diffs: [] })
+    j2.transitionBatch('DONE')
+    assert.equal(j2.state.outcome, 'PARTIAL', 'an excluded planned session must not read as a full success')
+    assert.equal(j2.state.partialExcluded.length, 1)
+    const j3 = make('j3.json')
+    assert.throws(() => j3.recordPartial([{ id: 'planned-b' }]), /reason/)
+  } finally {
+    rmSync(jobDir, { recursive: true, force: true })
+  }
+})
+
+test('P2 W3: multiple membership actions on one session compensate as ONE group — no false user-change conflict; real user change still pending', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
+  const { importSessionViaA } = await import('../lib/import/writer-a.js')
+  const run = async userChange => {
+    const t = await mountTarget()
+    const jobDir = mkdtempSync(join(tmpdir(), 'w3-multi-'))
+    const wdir = join(t.base, 'w')
+    mkdirSync(wdir, { recursive: true })
+    const W = await t.workspaceRegistry.create(wdir, 'W')
+    const s = await canonicalCandidate('w3-s', wdir)
+    await importSessionViaA(t.persistence, s)
+    await W.attachSession('w3-s')
+    await t.workspaceRegistry.pinSession('w3-s')
+    const journal = ImportJournal.init(join(jobDir, 'j.json'), { instanceFingerprint: t.instanceFingerprint, sourceDigest: 'src' })
+    const snapshot = await captureTargetPreState({ persistence: t.persistence, workspaceRegistry: t.workspaceRegistry, plannedSessionIds: ['w3-new'], relatedSessionIds: ['w3-s'] })
+    journal.transitionBatch('PLANNED')
+    journal.setSnapshot(snapshot)
+    journal.transitionBatch('SNAPSHOT_READY')
+    journal.transitionBatch('IMPORTING')
+    const s1 = journal.intent({ type: 'session.unpin', sessionId: 'w3-s' })
+    await t.workspaceRegistry.unpinSession('w3-s')
+    journal.confirm(s1, { membershipAfter: { pinned: false, archived: false } })
+    const s2 = journal.intent({ type: 'session.archive', sessionId: 'w3-s' })
+    await t.workspaceRegistry.archiveSession('w3-s')
+    journal.confirm(s2, { membershipAfter: { pinned: false, archived: true } })
+    if (userChange) await userChange(t)
+    journal.transitionBatch('ROLLING_BACK')
+    let withdrawCalls = 0
+    const rb = await rollbackBatch({
+      actions: journal.actionsReversed(),
+      snapshot,
+      plannedSessionIds: ['w3-new'],
+      workspaceRegistry: t.workspaceRegistry,
+      persistence: t.persistence,
+      withdrawSession: async () => { withdrawCalls += 1 },
+      journal,
+    })
+    return { rb, t, withdrawCalls, journal, jobDir }
+  }
+
+  const clean = await run(null)
+  try {
+    assert.equal(clean.rb.outcome, 'complete', JSON.stringify(clean.rb.conflicts))
+    assert.ok(clean.rb.compensated.some(c => c.startsWith('session.unpin:w3-s')), JSON.stringify(clean.rb.compensated))
+    assert.ok(clean.rb.compensated.some(c => c.startsWith('session.archive:w3-s')), JSON.stringify(clean.rb.compensated))
+    assert.ok(clean.t.workspaceRegistry.pinnedSessionIds.includes('w3-s'), 'pre-batch pin restored')
+    assert.ok(!clean.t.workspaceRegistry.archivedSessionIds.includes('w3-s'), 'pre-batch archive state restored')
+    assert.equal(clean.rb.conflicts.length, 0, 'our own restore must never be reported as a user conflict')
+  } finally {
+    await clean.t.unmount()
+    rmSync(clean.jobDir, { recursive: true, force: true })
+  }
+
+  // a genuine, OBSERVABLE user change after our last action: the user
+  // unarchives the session themselves.
+  const dirty = await run(async t => { await t.workspaceRegistry.unarchiveSession('w3-s') })
+  try {
+    assert.equal(dirty.rb.outcome, 'pending')
+    assert.ok(dirty.rb.conflicts.some(c => /membership changed after our session\.archive/.test(c.reason)), JSON.stringify(dirty.rb.conflicts))
+    assert.ok(!dirty.t.workspaceRegistry.archivedSessionIds.includes('w3-s'), 'the user unarchive must be preserved')
+    assert.ok(!dirty.t.workspaceRegistry.pinnedSessionIds.includes('w3-s'), 'no pin is re-applied over the user change')
+  } finally {
+    await dirty.t.unmount()
+    rmSync(dirty.jobDir, { recursive: true, force: true })
   }
 })
 
