@@ -132,6 +132,22 @@ test('F5: invalid UTF-8 and truncated skippable tails refuse; budgets bound DURI
     err => /budget/.test(err.message),
     'budget must stop before any later frame is touched',
   )
+  // 5) the SINGLE frame itself is bounded by the NATIVE output limit: a
+  // 4096-byte frame against a 16-byte budget must be refused by the decoder
+  // BEFORE its full output is allocated (ERR_BUFFER_TOO_LARGE path).
+  const bigFrame = zlib.zstdCompressSync(Buffer.from('x'.repeat(4096)))
+  assert.throws(
+    () => decompressZstdMultiFrame(bigFrame, { maxBytes: 16 }),
+    err => err.message.includes('native output limit applied before allocation') && /budget/.test(err.message),
+    'single-frame output must be capped natively, not allocated then refused',
+  )
+  // 6) budget 0 refuses before any decode; exact-fit output passes.
+  assert.throws(
+    () => decompressZstdMultiFrame(bigFrame, { maxBytes: 0 }),
+    err => /budget/.test(err.message),
+  )
+  const exact = decompressZstdMultiFrame(zlib.zstdCompressSync(Buffer.from('y'.repeat(16))), { maxBytes: 16 })
+  assert.equal(exact.length, 16, 'output exactly at budget is admitted')
   // 5) row JSON errors carry a FIXED message (no source fragments) and the
   // parsed header for identity salvage — no second unbounded decompression.
   const badRow = Buffer.concat([header, Buffer.from('{"x": "SYNTHCHAT-marker" NOPE\n')])
@@ -566,6 +582,96 @@ test('F3: CLI staging root is a CONTAINER — job subdirectory removed, sentinel
     }
   } finally {
     rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('F2: final artifact budget — child binding that pushes the output over maxEvents refuses', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
+  await injectLoader()
+  const unmount = await mountLocation()
+  const codec = await v3codec()
+  const dir = mkdtempSync(join(tmpdir(), 'f2-budget-'))
+  try {
+    const mk = () => buildV5Archive([
+      fileEntry('sessions', `${officialDirFor('bp')}/session.v3.jsonl`, v3SessionBytes(codec, 'bp'), 'sessions'),
+      fileEntry('sessions', `${officialDirFor('bc')}/session.v3.jsonl`, v3SessionBytes(codec, 'bc', { origin: 'subagent', parentSession: 'bp', descriptor: { provider: 'p', version: 1, mode: 'continuable', label: 'l' } }), 'sessions'),
+    ])
+    // budget 2: parent (2 events) + bound child fact pushes the final
+    // artifact to 3 — the FINAL count must refuse, not the initial one.
+    const over = mkdtempSync(join(tmpdir(), 'f2-over-'))
+    writeFileSync(join(dir, 'over.gz'), mk())
+    const rOver = await inspectSessions(join(dir, 'over.gz'), { stagingRoot: join(over, 'stg'), sessionBudget: { maxEvents: 2 } })
+    const pOver = rOver.sessions.find(s => s.id === 'bp')
+    assert.equal(pOver.status, 'refused', 'final artifact over budget must refuse')
+    assert.equal(pOver.code, 'SESSION_BUDGET')
+    assert.ok((pOver.error ?? '').includes('final artifact'), `final-count refusal (got ${pOver.error})`)
+    rmSync(over, { recursive: true, force: true })
+    // budget 3: the same archive passes (canonical 3 ≤ 3).
+    const fits = mkdtempSync(join(tmpdir(), 'f2-fits-'))
+    writeFileSync(join(dir, 'fits.gz'), mk())
+    const rFits = await inspectSessions(join(dir, 'fits.gz'), { stagingRoot: join(fits, 'stg'), sessionBudget: { maxEvents: 3 } })
+    const pFits = rFits.sessions.find(s => s.id === 'bp')
+    assert.equal(pFits.status, 'restored')
+    assert.equal(pFits.importable, true)
+    assert.equal(pFits.canonicalEvents, 3)
+    rmSync(fits, { recursive: true, force: true })
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+    await unmount()
+  }
+})
+
+test('selection: a declared-missing highest generation blocks fallback; a present highest ignores lower missing slots', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
+  await injectLoader()
+  const unmount = await mountLocation()
+  const codec = await v3codec()
+  const dir = mkdtempSync(join(tmpdir(), 'gen-missing-'))
+  try {
+    // Case 1: v3 FILE + same-dir v4 MISSING (PARTIAL archive) → no silent
+    // fallback; the directory is refused with the stable reason and the
+    // lower generation stays as diagnostics.
+    const gz1 = buildV5Archive([
+      fileEntry('sessions', `${officialDirFor('g-up')}/session.v3.jsonl`, v3SessionBytes(codec, 'g-up'), 'sessions'),
+      missingEntry('sessions', `${officialDirFor('g-up')}/session.v4.jsonl`, 'sessions'),
+    ], { manifest: { integrity: 'PARTIAL' } })
+    writeFileSync(join(dir, 'up.gz'), gz1)
+    const r1 = await inspectSessions(join(dir, 'up.gz'), { stagingRoot: join(dir, 'stg1') })
+    const up = r1.sessions.find(s => s.id === 'g-up')
+    assert.equal(up.status, 'refused', 'missing highest must refuse, not fall back to v3')
+    assert.equal(up.code, 'LEGACY_GENERATION_UNAVAILABLE')
+    assert.equal(up.sourceGeneration, 4)
+    assert.deepEqual(up.lowerGenerationsPresent, ['session.v3.jsonl'])
+    assert.equal(r1.counts.importable, 0)
+    assert.ok(r1.childEvidence.declaredMissing.some(m => m.path.endsWith('session.v4.jsonl')))
+    rmSync(join(dir, 'stg1'), { recursive: true, force: true })
+
+    // Case 2: v4 FILE + lower v3 MISSING → the valid highest is NOT blocked.
+    const gz2 = buildV5Archive([
+      fileEntry('sessions', `${officialDirFor('g-ok')}/session.v4.jsonl`, headerRow(4, 'g-ok'), 'sessions'),
+      missingEntry('sessions', `${officialDirFor('g-ok')}/session.v3.jsonl`, 'sessions'),
+    ], { manifest: { integrity: 'PARTIAL' } })
+    writeFileSync(join(dir, 'ok.gz'), gz2)
+    const r2 = await inspectSessions(join(dir, 'ok.gz'), { stagingRoot: join(dir, 'stg2') })
+    const ok = r2.sessions.find(s => s.id === 'g-ok')
+    assert.equal(ok.status, 'restored')
+    assert.equal(ok.importable, true, 'a present highest generation must not be blocked by a missing lower slot')
+    assert.equal(ok.sourceGeneration, 4)
+    rmSync(join(dir, 'stg2'), { recursive: true, force: true })
+
+    // Case 3: only a v3 FILE, no higher declaration → normal historical
+    // upgrade still applies.
+    const gz3 = buildV5Archive([
+      fileEntry('sessions', `${officialDirFor('g-plain')}/session.v3.jsonl`, v3SessionBytes(codec, 'g-plain'), 'sessions'),
+    ])
+    writeFileSync(join(dir, 'plain.gz'), gz3)
+    const r3 = await inspectSessions(join(dir, 'plain.gz'), { stagingRoot: join(dir, 'stg3') })
+    const plain = r3.sessions.find(s => s.id === 'g-plain')
+    assert.equal(plain.status, 'restored')
+    assert.equal(plain.importable, true)
+    assert.equal(plain.sourceGeneration, 3)
+    assert.equal(plain.outputGeneration, 4)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+    await unmount()
   }
 })
 
