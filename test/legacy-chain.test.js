@@ -51,8 +51,7 @@ function v4Fixture(id) {
   return { header, rows }
 }
 
-test('classify: current v4 header classifies as current', async () => {
-  if (skip) return
+test('classify: current v4 header classifies as current', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
   const { classifyHeader } = await loadChain()
   const f = v4Fixture('session-cls-1')
   const cls = await classifyHeader(f.header)
@@ -60,8 +59,7 @@ test('classify: current v4 header classifies as current', async () => {
   assert.equal(cls.storedVersion, 4)
 })
 
-test('classify: unknown future version is LEGACY_HEADER_UNSUPPORTED', async () => {
-  if (skip) return
+test('classify: unknown future version is LEGACY_HEADER_UNSUPPORTED', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
   const { classifyHeader, migrateToV4, LEGACY_CODES } = await loadChain()
   const f = v4Fixture('session-cls-2')
   // readHeader classifies without throwing; migrateToV4 turns 'unsupported'
@@ -75,8 +73,7 @@ test('classify: unknown future version is LEGACY_HEADER_UNSUPPORTED', async () =
   )
 })
 
-test('classify: malformed header is LEGACY_HEADER_UNSUPPORTED', async () => {
-  if (skip) return
+test('classify: malformed header is LEGACY_HEADER_UNSUPPORTED', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
   const { classifyHeader, migrateToV4, LEGACY_CODES } = await loadChain()
   const cls = await classifyHeader({ type: 'session', version: 4, id: 'x' }) // missing fields
   assert.equal(cls.status, 'malformed')
@@ -86,8 +83,7 @@ test('classify: malformed header is LEGACY_HEADER_UNSUPPORTED', async () => {
   )
 })
 
-test('v4 restore + canonical encode + round-trip self-check passes', async () => {
-  if (skip) return
+test('v4 restore + canonical encode + round-trip self-check passes', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
   const { migrateToV4 } = await loadChain()
   const f = v4Fixture('session-rt-1')
   const out = await migrateToV4(f.header, f.rows, { childFacts: null })
@@ -96,8 +92,7 @@ test('v4 restore + canonical encode + round-trip self-check passes', async () =>
   assert.equal(out.inheritedEventCount, 0)
 })
 
-test('v4 restore with a bad row is LEGACY_ROW_DECODE_FAILED', async () => {
-  if (skip) return
+test('v4 restore with a bad row is LEGACY_ROW_DECODE_FAILED', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
   const { migrateToV4, LEGACY_CODES } = await loadChain()
   const f = v4Fixture('session-badrow')
   const badRows = [{ ...f.rows[0], seq: 5 }, ...f.rows.slice(1)] // gap at start
@@ -111,8 +106,7 @@ test('v4 restore with a bad row is LEGACY_ROW_DECODE_FAILED', async () => {
   )
 })
 
-test('v3 header goes through the historical catalog', async () => {
-  if (skip) return
+test('v3 header goes through the historical catalog', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
   const { classifyHeader } = await loadChain()
   const f = v4Fixture('session-v3')
   const v3Header = { ...f.header, version: 3 }
@@ -123,8 +117,7 @@ test('v3 header goes through the historical catalog', async () => {
   assert.ok(['current', 'migration-required'].includes(cls.status), `status ${cls.status}`)
 })
 
-test('v0 real-shape negative sample classifies and is rejected (chronology)', async () => {
-  if (skip) return
+test('v0 real-shape negative sample classifies and is rejected (chronology)', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
   const { readFile } = await import('node:fs/promises')
   // The released v0 real-shape fixture ships with DSHA (committed to the
   // handoff); it must classify via the historical catalog and be REJECTED,
@@ -149,19 +142,46 @@ test('v0 real-shape negative sample classifies and is rejected (chronology)', as
   )
 })
 
-test('v0/v1 packed-row decode: packed rows expand via finish(), not line count', async () => {
-  if (skip) return
-  // packed-row semantics smoke test on the CURRENT (v4) path: N physical rows
-  // in → N logical events out (v0/v1 packing is handled by the official
-  // chain's decodeRow; the contract here is finish().events is the count).
+test('genuine packed v1: one text-chunks physical row expands to TWO logical events through the official chain', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
   const { migrateToV4 } = await loadChain()
-  const f = v4Fixture('session-packed')
-  const out = await migrateToV4(f.header, f.rows, { childFacts: null })
-  assert.equal(out.eventRows.length, f.rows.length)
+  const req = createRequire(join(rc4Dir, 'noop.js'))
+  const v01 = await import(pathToFileURL(req.resolve('@deepseek-ai/dsh-session-format-v0-to-v1')).href)
+  const header = { type: 'session', version: 1, id: 'synthetic-packed-v1', createdAt: 1, cwd: '/synthetic', delegationDepth: 0 }
+  const e = (type, seq, data, extra = {}) => ({ type, seq, time: seq + 100, data, ...extra })
+  const packedRows = [
+    e('turn/start', 0, { turn: 1 }),
+    e('step/start', 1, { turn: 1, step: 1 }),
+    { type: 'text-chunks', seq0: 2, time0: 102, data: { turn: 1, step: 1, index: 0, dt: [1], texts: ['A', 'B'] } },
+    e('step/end', 4, { turn: 1, step: 1 }),
+    e('turn/end', 5, { turn: 1, reason: { kind: 'completed' } }),
+  ]
+
+  // Direct codec oracle: exactly ONE packed run, expanding to 2 events.
+  const dec = v01.releasedV1SessionFormatCodec.createDecoder(header, 'strict')
+  const decoded = []
+  const ctx = { emitEvent: v => decoded.push(v), emitRun: r => decoded.push(...r.expand()) }
+  for (const row of packedRows) dec.decodeRow(row, ctx)
+  dec.finish(ctx)
+  assert.equal(decoded.length, 6, '5 physical rows must decode to 6 logical events')
+  const runEvents = decoded.filter(x => x.type === 'assistant/chunk')
+  assert.equal(runEvents.length, 2, 'the packed run expands to exactly 2 events')
+  assert.deepEqual(runEvents.map(x => x.seq), [2, 3])
+  assert.deepEqual(runEvents.map(x => x.data.chunk.text), ['A', 'B'])
+
+  // Through the plugin chain: same expansion, physical rows preserved, and
+  // the packed texts survive the v1→v4 rewrite (migrateToV4 already ran the
+  // deep round-trip self-check on its own output).
+  const out = await migrateToV4(header, packedRows, { childFacts: [] })
+  assert.equal(out.rowCount, 5, 'source physical row count must not collapse to 0')
+  assert.equal(out.eventRows.length, 6)
+  assert.deepEqual(out.eventRows.map(x => x.seq), [0, 1, 2, 3, 4, 5])
+  assert.deepEqual(out.eventRows.map(x => x.type),
+    ['turn/start', 'step/start', 'system/message', 'assistant/attempt', 'step/end', 'turn/end'])
+  const blob = out.eventRows.map(x => JSON.stringify(x)).join('|')
+  assert.ok(blob.includes('"A"') && blob.includes('"B"'), 'packed chunk texts must survive the v1→v4 migration')
 })
 
-test('synthetic v3 positive: official codec encode → official chain restore → v4 round-trip', async () => {
-  if (skip) return
+test('synthetic v3 positive: official codec encode → official chain restore → v4 round-trip', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
   const { classifyHeader, migrateToV4 } = await loadChain()
   const req = createRequire(join(rc4Dir, 'noop.js'))
   const v23 = await import(pathToFileURL(req.resolve('@deepseek-ai/dsh-session-format-v2-to-v3')).href)
@@ -194,8 +214,7 @@ test('synthetic v3 positive: official codec encode → official chain restore �
   assert.equal(out.headerRow.id, id)
 })
 
-test('synthetic v2 positive: same pipeline through the v2 codec', async () => {
-  if (skip) return
+test('synthetic v2 positive: same pipeline through the v2 codec', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
   const { migrateToV4 } = await loadChain()
   const req = createRequire(join(rc4Dir, 'noop.js'))
   const v12 = await import(pathToFileURL(req.resolve('@deepseek-ai/dsh-session-format-v1-to-v2')).href)
@@ -224,10 +243,16 @@ test('synthetic v2 positive: same pipeline through the v2 codec', async () => {
   assert.ok(out.eventRows.length >= logicalEvents.length, `expected >= ${logicalEvents.length} events, got ${out.eventRows.length}`)
   assert.equal(out.headerRow.version, 4)
   assert.equal(out.headerRow.id, id)
+  // Content preservation: the original user message text must survive the
+  // official rewrite (the migrated artifact was deep-compared internally;
+  // here we assert the surviving canonical rows still carry it).
+  const roundTripTexts = out.eventRows
+    .map(r => { try { return JSON.stringify(r) } catch { return '' } })
+    .join('|')
+  assert.ok(roundTripTexts.includes('保留这句话'), 'original user message text must survive the v2→v4 rewrite')
 })
 
-test('v3 parent with subagent child: child facts restore the parent to v4', async () => {
-  if (skip) return
+test('v3 parent with subagent child: child facts restore the parent to v4', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
   const chain = await loadChain()
   const { classifyHeader, restoreArtifact, childFactsFromArtifacts, restoreParentWithChildren, encodeCanonicalV4AndSelfCheck, LEGACY_CODES } = chain
   const req = createRequire(join(rc4Dir, 'noop.js'))
@@ -265,8 +290,7 @@ test('v3 parent with subagent child: child facts restore the parent to v4', asyn
   void LEGACY_CODES
 })
 
-test('v3 parent restore still works when the archive declares no direct children (empty set)', async () => {
-  if (skip) return
+test('v3 parent restore still works when the archive declares no direct children (empty set)', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
   const { restoreParentWithChildren, encodeCanonicalV4AndSelfCheck } = await loadChain()
   const e = (type, seq, data, extra = {}) => ({ type, seq, time: seq + 100, data, ...extra })
   const parentHeader = { type: 'session', version: 3, id: 'session-solo', createdAt: 1793500000000, cwd: '/tmp/proj', isSeeded: false, delegationDepth: 0 }
@@ -285,8 +309,7 @@ test('v3 parent restore still works when the archive declares no direct children
   assert.equal(canonical.headerRow.id, 'session-solo')
 })
 
-test('CHILD_EVIDENCE: parent rows carry subagent/catalog but no fact bound → official chain refuses', async () => {
-  if (skip) return
+test('CHILD_EVIDENCE: parent rows carry subagent/catalog but no fact bound → official chain refuses', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
   const { restoreParentWithChildren, LEGACY_CODES } = await loadChain()
   const e = (type, seq, data, extra = {}) => ({ type, seq, time: seq + 100, data, ...extra })
   const parentHeader = { type: 'session', version: 3, id: 'p-ev', createdAt: 1, cwd: '/w', isSeeded: false, delegationDepth: 0 }
@@ -312,8 +335,7 @@ test('CHILD_EVIDENCE: parent rows carry subagent/catalog but no fact bound → o
   )
 })
 
-test('CHILD_EVIDENCE: parent rows + matching fact restore to v4; unrelated fact set refuses', async () => {
-  if (skip) return
+test('CHILD_EVIDENCE: parent rows + matching fact restore to v4; unrelated fact set refuses', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
   const { restoreArtifact, childFactsFromArtifacts, restoreParentWithChildren, encodeCanonicalV4AndSelfCheck } = await loadChain()
   const req = createRequire(join(rc4Dir, 'noop.js'))
   const cat = await import(pathToFileURL(req.resolve('@deepseek-ai/dsh-session-format-catalog')).href)
@@ -355,8 +377,7 @@ test('CHILD_EVIDENCE: parent rows + matching fact restore to v4; unrelated fact 
   assert.equal(canonicalOther.headerRow.version, 4)
 })
 
-test('v1 raw physical rows: shared-layout header + rows decode through the official v1 codec', async () => {
-  if (skip) return
+test('v1 raw physical rows: shared-layout header + rows decode through the official v1 codec', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
   // v1 codec is decode-only (no encode); rows are the shared physical layout
   // built by hand per DSHA's test harness shape.
   const req = createRequire(join(rc4Dir, 'noop.js'))
@@ -400,8 +421,7 @@ test('v1 raw physical rows: shared-layout header + rows decode through the offic
   assert.equal(out.headerRow.id, 'session-synth-v1')
 })
 
-test('R1: one-shot generator input produces the SAME full result as an array (no silent empty session)', async () => {
-  if (skip) return
+test('R1: one-shot generator input produces the SAME full result as an array (no silent empty session)', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
   const { migrateToV4 } = await loadChain()
   const f = v4Fixture('session-gen')
   // Array baseline
@@ -419,8 +439,7 @@ test('R1: one-shot generator input produces the SAME full result as an array (no
   )
 })
 
-test('R2: round-trip self-check rejects content-changing fault injection', async () => {
-  if (skip) return
+test('R2: round-trip self-check rejects content-changing fault injection', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
   const { encodeCanonicalV4AndSelfCheck, assertDeepRoundTrip, migrateToV4, LEGACY_CODES } = await loadChain()
   const f = v4Fixture('session-fault')
   // Build a legitimate artifact via the normal path first.
@@ -442,8 +461,7 @@ test('R2: round-trip self-check rejects content-changing fault injection', async
   void good
 })
 
-test('R5: precise legacy codes — chronology/child-evidence/row-decode/round-trip each assert their exact code', async () => {
-  if (skip) return
+test('R5: precise legacy codes — chronology/child-evidence/row-decode/round-trip each assert their exact code', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
   const { restoreArtifact, migrateToV4, restoreParentWithChildren, LEGACY_CODES } = await loadChain()
   const e = (type, seq, data, extra = {}) => ({ type, seq, time: seq + 100, data, ...extra })
   const f = v4Fixture('session-codes')
@@ -502,4 +520,96 @@ test('R5: precise legacy codes — chronology/child-evidence/row-decode/round-tr
     error => error.code === LEGACY_CODES.ROUNDTRIP_MISMATCH,
   )
   void migrateToV4
+})
+
+// ---------------------------------------------------------------------------
+// R4: child-evidence differential matrix (rc.4 behaviors verified in the
+// review and re-verified here against the same packages).
+// ---------------------------------------------------------------------------
+
+function parentWithCatalogRow(catalogData) {
+  const e = (type, seq, data, extra = {}) => ({ type, seq, time: seq + 100, data, ...extra })
+  const header = { type: 'session', version: 3, id: 'p-matrix', createdAt: 1793500000000, cwd: '/w', isSeeded: false, delegationDepth: 0 }
+  return { header, rows: [
+    e('turn/start', 0, { turn: 1 }),
+    e('subagent/catalog', 1, catalogData),
+    e('turn/end', 2, { turn: 1, reason: { kind: 'completed' } }),
+  ] }
+}
+
+test('R4 matrix: legal v1/continuable parent catalog row + EMPTY facts succeeds (parent row is self-sufficient)', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
+  const { restoreParentWithChildren, encodeCanonicalV4AndSelfCheck } = await loadChain()
+  const { header, rows } = parentWithCatalogRow({ childId: 'child-a', mode: 'continuable', version: 1, provider: 'p', label: 'l', childCreatedAt: 1793500001000 })
+  const parent = await restoreParentWithChildren(header, rows, [])
+  const canonical = await encodeCanonicalV4AndSelfCheck(parent.artifact)
+  assert.equal(canonical.headerRow.version, 4)
+})
+
+test('R4 matrix: same legal parent catalog + MATCHING fact succeeds (3 events)', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
+  const { restoreArtifact, childFactsFromArtifacts, restoreParentWithChildren, encodeCanonicalV4AndSelfCheck } = await loadChain()
+  const { createRequire: cr } = await import('node:module')
+  const { pathToFileURL: p2u } = await import('node:url')
+  const req = cr(join(rc4Dir, 'noop.js'))
+  const cat = await import(p2u(req.resolve('@deepseek-ai/dsh-session-format-catalog')).href)
+  // Build the matching child artifact.
+  const childHeader = { type: 'session', version: 3, id: 'child-a', createdAt: 1793500001000, cwd: '/w', isSeeded: false, delegationDepth: 1, origin: 'subagent', parentSession: 'p-matrix' }
+  const restore = cat.historicalSessionFormatCatalog.createRestore(childHeader, { recovery: 'strict', validation: 'current' })
+  const e = (type, seq, data, extra = {}) => ({ type, seq, time: seq + 100, data, ...extra })
+  for (const row of [
+    e('turn/start', 0, { turn: 1 }),
+    e('subagent/descriptor', 1, { provider: 'p', version: 1, mode: 'continuable', label: 'l' }),
+    e('turn/end', 2, { turn: 1, reason: { kind: 'completed' } }),
+  ]) restore.decodeRow(row)
+  const childArtifact = restore.finish()
+  const facts = await childFactsFromArtifacts([childArtifact])
+
+  const { header, rows } = parentWithCatalogRow({ childId: 'child-a', mode: 'continuable', version: 1, provider: 'p', label: 'l', childCreatedAt: 1793500001000 })
+  const parent = await restoreParentWithChildren(header, rows, facts)
+  const canonical = await encodeCanonicalV4AndSelfCheck(parent.artifact)
+  assert.equal(canonical.eventRows.length, 3)
+})
+
+test('R4 matrix: same parent catalog + CONFLICTING childCreatedAt fact → official refusal (conflicts with its parent catalog)', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
+  const { restoreParentWithChildren } = await loadChain()
+  const { header, rows } = parentWithCatalogRow({ childId: 'child-a', mode: 'continuable', version: 1, provider: 'p', label: 'l', childCreatedAt: 1793500001000 })
+  const conflictingFact = { childId: 'child-a', childCreatedAt: 9999999999999, descriptorCount: 1, descriptor: { provider: 'p', version: 1, mode: 'continuable', label: 'l' } }
+  await assert.rejects(
+    () => restoreParentWithChildren(header, rows, [conflictingFact]),
+    error => /conflicts with its parent catalog/i.test(error.message ?? ''),
+  )
+})
+
+test('R4 matrix: same parent catalog + UNRELATED childId fact ADDS a new subagent/catalog event (not ignored)', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
+  const { restoreParentWithChildren } = await loadChain()
+  const { header, rows } = parentWithCatalogRow({ childId: 'child-a', mode: 'continuable', version: 1, provider: 'p', label: 'l', childCreatedAt: 1793500001000 })
+  const unrelatedFact = { childId: 'child-b', childCreatedAt: 1793500002000, descriptorCount: 1, descriptor: { provider: 'p', version: 1, mode: 'continuable', label: 'b' } }
+  // The chain tolerates and ADDS the unrelated child as its own catalog row.
+  const parent = await restoreParentWithChildren(header, rows, [unrelatedFact])
+  assert.ok(parent.artifact.events.length >= rows.length + 1, 'unrelated fact must ADD a catalog entry, not be ignored')
+})
+
+test('R4 matrix: INVALID v0/unknown parent catalog row refuses with empty AND matching facts (fact shape is not the differentiator)', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
+  const { restoreParentWithChildren } = await loadChain()
+  const { header, rows } = parentWithCatalogRow({ childId: 'child-x', mode: 'unknown', version: 0 })
+  // Empty facts: refuses (row payload itself is illegal).
+  await assert.rejects(() => restoreParentWithChildren(header, rows, []), error => /catalog/i.test(error.message ?? ''))
+  // Even a MATCHING fact must not rescue an illegal parent row payload.
+  const matchingFact = { childId: 'child-x', childCreatedAt: 1793500001000, descriptorCount: 1, descriptor: { provider: 'p', version: 1, mode: 'continuable', label: 'x' } }
+  await assert.rejects(() => restoreParentWithChildren(header, rows, [matchingFact]), error => /catalog/i.test(error.message ?? ''))
+})
+
+test('R4 matrix: parent WITHOUT catalog rows + legal matching fact → chain adds the catalog (completes evidence)', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
+  const { restoreParentWithChildren, encodeCanonicalV4AndSelfCheck } = await loadChain()
+  const e = (type, seq, data, extra = {}) => ({ type, seq, time: seq + 100, data, ...extra })
+  const header = { type: 'session', version: 3, id: 'p-nocat', createdAt: 1793500000000, cwd: '/w', isSeeded: false, delegationDepth: 0 }
+  const rows = [
+    e('turn/start', 0, { turn: 1 }),
+    e('step/start', 1, { turn: 1, step: 1 }),
+    e('step/end', 2, { turn: 1, step: 1 }),
+    e('turn/end', 3, { turn: 1, reason: { kind: 'completed' } }),
+  ]
+  const matchingFact = { childId: 'child-c', childCreatedAt: 1793500001000, descriptorCount: 1, descriptor: { provider: 'p', version: 1, mode: 'continuable', label: 'c' } }
+  const parent = await restoreParentWithChildren(header, rows, [matchingFact])
+  const canonical = await encodeCanonicalV4AndSelfCheck(parent.artifact)
+  assert.equal(canonical.headerRow.version, 4)
 })
