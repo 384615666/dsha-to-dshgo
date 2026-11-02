@@ -399,3 +399,107 @@ test('v1 raw physical rows: shared-layout header + rows decode through the offic
   assert.equal(out.headerRow.version, 4)
   assert.equal(out.headerRow.id, 'session-synth-v1')
 })
+
+test('R1: one-shot generator input produces the SAME full result as an array (no silent empty session)', async () => {
+  if (skip) return
+  const { migrateToV4 } = await loadChain()
+  const f = v4Fixture('session-gen')
+  // Array baseline
+  const fromArray = await migrateToV4(f.header, f.rows, { childFacts: null })
+  assert.equal(fromArray.eventRows.length, f.rows.length)
+  // One-shot generator with identical rows: must NOT silently yield an
+  // empty session (review counterexample: 5 events → 0 events, "success").
+  function* gen() { yield* f.rows }
+  const fromGen = await migrateToV4(f.header, gen(), { childFacts: null })
+  assert.equal(fromGen.rowCount, f.rows.length, 'row count must survive phase 2')
+  assert.equal(fromGen.eventRows.length, f.rows.length)
+  assert.deepEqual(
+    fromGen.eventRows.map(r => JSON.stringify(r)),
+    fromArray.eventRows.map(r => JSON.stringify(r)),
+  )
+})
+
+test('R2: round-trip self-check rejects content-changing fault injection', async () => {
+  if (skip) return
+  const { encodeCanonicalV4AndSelfCheck, assertDeepRoundTrip, migrateToV4, LEGACY_CODES } = await loadChain()
+  const f = v4Fixture('session-fault')
+  // Build a legitimate artifact via the normal path first.
+  const good = await migrateToV4(f.header, f.rows, { childFacts: null })
+  // Reconstruct an artifact whose event text was rewritten but count/header
+  // kept — exactly the fault-injection the review proved the old check missed.
+  const tampered = {
+    header: { ...f.header },
+    events: f.rows.map((row, i) => i === 1
+      ? { ...row, data: { ...row.data, content: [{ type: 'text', text: '被篡改的内容' }] } }
+      : row),
+    inheritedEventCount: 0,
+  }
+  assert.throws(
+    () => assertDeepRoundTrip(tampered, { header: tampered.header, events: f.rows, inheritedEventCount: 0 }),
+    error => error.code === LEGACY_CODES.ROUNDTRIP_MISMATCH,
+    'rewritten message text must be refused by the deep comparison',
+  )
+  void good
+})
+
+test('R5: precise legacy codes — chronology/child-evidence/row-decode/round-trip each assert their exact code', async () => {
+  if (skip) return
+  const { restoreArtifact, migrateToV4, restoreParentWithChildren, LEGACY_CODES } = await loadChain()
+  const e = (type, seq, data, extra = {}) => ({ type, seq, time: seq + 100, data, ...extra })
+  const f = v4Fixture('session-codes')
+
+  // ROW_DECODE_FAILED: plain bad row (surface chronology during decode).
+  await assert.rejects(
+    () => restoreArtifact(f.header, [{ ...f.rows[1] }], {}),
+    error => error.code === LEGACY_CODES.ROW_DECODE_FAILED,
+  )
+
+  // CHILD_EVIDENCE_INCOMPLETE: parent declares subagent/catalog with an
+  // INVALID fact payload (version 0 / mode unknown is not a supported fact),
+  // restored with an empty fact set. The refusal comes from finish().
+  const parentHeader = { type: 'session', version: 3, id: 'p-codes', createdAt: 1, cwd: '/w', isSeeded: false, delegationDepth: 0 }
+  const rows = [
+    e('turn/start', 0, { turn: 1 }),
+    e('subagent/catalog', 1, { childId: 'missing-child', mode: 'unknown', version: 0 }),
+    e('turn/end', 2, { turn: 1, reason: { kind: 'completed' } }),
+  ]
+  await assert.rejects(
+    () => restoreParentWithChildren(parentHeader, rows, []),
+    error => error.code === LEGACY_CODES.CHILD_EVIDENCE_INCOMPLETE,
+  )
+
+  // HEADER_UNSUPPORTED: future version via migrateToV4.
+  await assert.rejects(
+    () => migrateToV4({ ...f.header, version: 9 }, []),
+    error => error.code === LEGACY_CODES.HEADER_UNSUPPORTED,
+  )
+
+  // CHRONOLOGY_UNREACHABLE: v2 surface before the first step cannot acquire
+  // a system head (SessionFormatUnsupportedMigrationError from the v2→v3
+  // stage) — normalizeFinishError maps it to the precise chronology code.
+  const { createRequire: cr } = await import('node:module')
+  const { pathToFileURL: p2u } = await import('node:url')
+  const req2 = cr(join(rc4Dir, 'noop.js'))
+  const v12 = await import(p2u(req2.resolve('@deepseek-ai/dsh-session-format-v1-to-v2')).href)
+  const v2Header = v12.releasedV2SessionFormatCodec.encodeHeader(
+    { version: 2, id: `${f.header.id}-v2`, createdAt: 1793500000000, cwd: '/tmp/proj', isSeeded: false, delegationDepth: 0 }, 0)
+  const surfFirst = [
+    e('user/message', 0, { id: `${f.header.id}-user`, role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'x' }] }, { surfaceOp: 'append' }),
+  ]
+  await assert.rejects(
+    () => restoreArtifact(v2Header, surfFirst, {}),
+    error => {
+      assert.equal(error.code, LEGACY_CODES.CHRONOLOGY_UNREACHABLE)
+      assert.match(error.message, /system head/)
+      return true
+    },
+  )
+
+  // ROUNDTRIP_MISMATCH: direct assertion via the comparator.
+  const { assertDeepRoundTrip } = await import('../lib/migration/legacy-chain.js')
+  assert.throws(
+    () => assertDeepRoundTrip({ header: f.header, events: f.rows, inheritedEventCount: 0 }, { header: f.header, events: [], inheritedEventCount: 0 }),
+    error => error.code === LEGACY_CODES.ROUNDTRIP_MISMATCH,
+  )
+  void migrateToV4
+})
