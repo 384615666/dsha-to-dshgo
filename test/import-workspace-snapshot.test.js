@@ -11,6 +11,18 @@ import { pathToFileURL } from 'node:url'
 import { ImportJournal } from '../lib/import/journal.js'
 import { captureTargetPreState, computeSnapshotDigest } from '../lib/import/g6.js'
 
+// The committed entity projection of a json storage unit (host-side knowledge
+// supplied through the provider contract).
+export function projectionFromUnit(bytes) {
+  const unit = JSON.parse(Buffer.from(bytes).toString('utf8'))
+  return {
+    workspaceIds: unit.global?.workspaceIds ?? [],
+    archivedSessionIds: unit.global?.archivedSessionIds ?? [],
+    pinnedSessionIds: unit.global?.pinnedSessionIds ?? [],
+    workspaces: unit.tables?.workspaces ?? {},
+  }
+}
+
 const rc4Dir = process.env.RC4_MODULES
 const skip = !rc4Dir
 
@@ -37,11 +49,12 @@ async function mountTarget() {
     storageRoot,
     workspaceRegistry: ctx.workspaceRegistry,
     persistence: ctx.sessionPersistence,
-    // The host knows the backend's real unit location; the module never
-    // guesses it. For this json backend the domain unit is <root>/workspace.json.
+    // The host knows the backend's real unit location AND how to project the
+    // committed entity state from those bytes (cross-layer contract). For
+    // this json backend the domain unit is <root>/workspace.json.
     unitProvider: async () => {
-      const file = join(storageRoot, 'workspace.json')
-      return { bytes: readFileSync(file) }
+      const bytes = readFileSync(join(storageRoot, 'workspace.json'))
+      return { bytes, projection: projectionFromUnit(bytes) }
     },
     async unmount() {
       try { await ctx.fiber?.dispose?.() } catch { /* best effort */ }
@@ -127,7 +140,8 @@ test('P2 workspace snapshot: a state change DURING capture is retried — no mix
         mutated = true
         await W.setTitle('during-capture-user-title')
       }
-      return { bytes: readFileSync(join(t.storageRoot, 'workspace.json')) }
+      const bytes = readFileSync(join(t.storageRoot, 'workspace.json'))
+      return { bytes, projection: projectionFromUnit(bytes) }
     }
     const snapshot = await captureTargetPreState({
       persistence: t.persistence,
@@ -166,7 +180,8 @@ test('P2 workspace snapshot: a never-stable target is refused with G6_SNAPSHOT_U
     const provider = async () => {
       n += 1
       await W.setTitle(`unstable-${n}`)
-      return { bytes: readFileSync(join(t.storageRoot, 'workspace.json')) }
+      const bytes = readFileSync(join(t.storageRoot, 'workspace.json'))
+      return { bytes, projection: projectionFromUnit(bytes) }
     }
     await assert.rejects(
       () => captureTargetPreState({
@@ -211,6 +226,126 @@ test('P2 workspace snapshot: a file fsync failure aborts capture — no admissio
       fsmod.fsyncSync = real
     }
     assert.ok(!existsSync(join(jobDir, 'workspace-unit.json')), 'no published copy after a failed fsync')
+  } finally {
+    await t.unmount()
+    rmSync(jobDir, { recursive: true, force: true })
+  }
+})
+
+test('P2 workspace snapshot: storage committed but entity projection lagging is NOT accepted — cross-layer mismatch retries', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
+  const t = await mountTarget()
+  const jobDir = mkdtempSync(join(tmpdir(), 'ws-cross-'))
+  try {
+    const wdir = join(t.base, 'w5')
+    mkdirSync(wdir, { recursive: true })
+    const W = await t.workspaceRegistry.create(wdir, 'old-title')
+    const unitFile = join(t.storageRoot, 'workspace.json')
+    const staleBytes = readFileSync(unitFile)
+    const staleProjection = projectionFromUnit(staleBytes)
+    await W.setTitle('new-title')
+    let calls = 0
+    // The first attempt sees individually-stable views that DISAGREE across
+    // layers (registry new, provider projection stale) — the pending-window
+    // shape. From attempt 2 both agree.
+    const provider = async () => {
+      calls += 1
+      const bytes = readFileSync(unitFile)
+      return { bytes, projection: calls <= 2 ? staleProjection : projectionFromUnit(bytes) }
+    }
+    const snapshot = await captureTargetPreState({
+      persistence: t.persistence,
+      workspaceRegistry: t.workspaceRegistry,
+      plannedSessionIds: ['ws-new-5'],
+      workspaceUnitProvider: provider,
+      snapshotDir: jobDir,
+      captureAttempts: 3,
+      captureRetryDelayMs: 1,
+    })
+    assert.ok(calls >= 4, `the cross-layer mismatch must trigger a retry (provider calls: ${calls})`)
+    assert.equal(snapshot.workspaces.find(w => w.id === W.id).title, 'new-title')
+    const copy = readFileSync(join(jobDir, snapshot.workspaceUnit.file))
+    assert.equal(snapshot.workspaceUnit.digest, (await import('node:crypto')).createHash('sha256').update(copy).digest('hex'))
+    // a permanently lagging projection cannot be published
+    const alwaysStale = async () => ({ bytes: readFileSync(unitFile), projection: staleProjection })
+    await assert.rejects(
+      () => captureTargetPreState({
+        persistence: t.persistence,
+        workspaceRegistry: t.workspaceRegistry,
+        plannedSessionIds: ['ws-new-6'],
+        workspaceUnitProvider: alwaysStale,
+        snapshotDir: jobDir,
+        captureAttempts: 2,
+        captureRetryDelayMs: 1,
+      }),
+      err => err.code === 'G6_SNAPSHOT_UNSTABLE',
+    )
+  } finally {
+    await t.unmount()
+    rmSync(jobDir, { recursive: true, force: true })
+  }
+})
+
+test('P2 workspace snapshot: a failed recapture never damages the copy an existing journal references', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
+  const t = await mountTarget()
+  const jobDir = mkdtempSync(join(tmpdir(), 'ws-immutable-'))
+  try {
+    const wdir = join(t.base, 'w6')
+    mkdirSync(wdir, { recursive: true })
+    const W = await t.workspaceRegistry.create(wdir, 'first-title')
+    const snapshot1 = await captureTargetPreState({
+      persistence: t.persistence,
+      workspaceRegistry: t.workspaceRegistry,
+      plannedSessionIds: ['ws-new-7'],
+      workspaceUnitProvider: t.unitProvider,
+      snapshotDir: jobDir,
+    })
+    const file1 = snapshot1.workspaceUnit.file
+    const digest1 = snapshot1.workspaceUnit.digest
+    const journal = ImportJournal.init(join(jobDir, 'j.json'), { instanceFingerprint: 'inst-im', sourceDigest: 'src-im' })
+    journal.transitionBatch('PLANNED')
+    journal.setSnapshot(snapshot1)
+    journal.transitionBatch('SNAPSHOT_READY')
+
+    // the target changes; a recapture fails at the POST-rename directory sync
+    await W.setTitle('second-title')
+    const fsmod = (await import('node:fs')).default
+    const real = fsmod.fsyncSync
+    let fsyncCalls = 0
+    fsmod.fsyncSync = fd => {
+      fsyncCalls += 1
+      if (fsyncCalls === 2) { const e = new Error('injected dir EIO'); e.code = 'EIO'; throw e }
+      return real(fd)
+    }
+    let recaptureError = null
+    try {
+      await captureTargetPreState({
+        persistence: t.persistence,
+        workspaceRegistry: t.workspaceRegistry,
+        plannedSessionIds: ['ws-new-8'],
+        workspaceUnitProvider: t.unitProvider,
+        snapshotDir: jobDir,
+      })
+    } catch (error) {
+      recaptureError = error
+    } finally {
+      fsmod.fsyncSync = real
+    }
+    assert.equal(recaptureError?.code, 'G6_SNAPSHOT_IO')
+    // the ORIGINAL object and the journal's reference are untouched
+    const original = readFileSync(join(jobDir, file1))
+    assert.equal((await import('node:crypto')).createHash('sha256').update(original).digest('hex'), digest1)
+    journal.transitionBatch('IMPORTING')
+    // a later successful capture produces a DIFFERENT content-addressed object
+    const snapshot3 = await captureTargetPreState({
+      persistence: t.persistence,
+      workspaceRegistry: t.workspaceRegistry,
+      plannedSessionIds: ['ws-new-9'],
+      workspaceUnitProvider: t.unitProvider,
+      snapshotDir: jobDir,
+    })
+    assert.notEqual(snapshot3.workspaceUnit.file, file1)
+    assert.ok(existsSync(join(jobDir, file1)), 'the old referenced copy is still present')
+    assert.ok(existsSync(join(jobDir, snapshot3.workspaceUnit.file)))
   } finally {
     await t.unmount()
     rmSync(jobDir, { recursive: true, force: true })
