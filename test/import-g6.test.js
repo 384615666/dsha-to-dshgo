@@ -159,7 +159,7 @@ test('P2 G6: full flow with intents/outcomes, reverse rollback, fresh-instance v
     mkdirSync(w1dir, { recursive: true })
     let seq = journal.intent({ type: 'workspace.create', workspaceId: null, workspacePath: w1dir })
     const W1 = await t.workspaceRegistry.create(w1dir, '本批工作区')
-    journal.confirm(seq, { workspaceId: W1.id })
+    journal.confirm(seq, { workspaceId: W1.id, title: W1.title, path: W1.path })
     journal.session('g6-s1', 'writing')
     const s1 = await canonicalCandidate('g6-s1', w1dir)
     seq = journal.intent({ type: 'session.import', sessionId: 'g6-s1' })
@@ -168,7 +168,7 @@ test('P2 G6: full flow with intents/outcomes, reverse rollback, fresh-instance v
     journal.session('g6-s1', 'readback-verified')
     seq = journal.intent({ type: 'session.attach', workspaceId: W1.id, sessionId: 'g6-s1' })
     await W1.attachSession('g6-s1')
-    journal.confirm(seq, {})
+    journal.confirm(seq, { title: W1.title, path: W1.path })
     journal.session('g6-s1', 'attached')
     assert.ok(await t.persistence.stat('g6-s1'), 'batch session visible after import')
 
@@ -199,6 +199,7 @@ test('P2 G6: full flow with intents/outcomes, reverse rollback, fresh-instance v
       workspaceRegistry: t.workspaceRegistry,
       persistence: t.persistence,
       withdrawSession,
+      journal,
     })
     assert.equal(rb.outcome, 'complete', `clean rollback must complete: ${JSON.stringify({ conflicts: rb.conflicts, failures: rb.failures, diffs: rb.verification.diffs })}`)
     assert.ok(rb.compensated.some(c => c.startsWith('session.attach:g6-s1')))
@@ -260,7 +261,7 @@ test('P2 G6 §4a: user archive after our unpin is PRESERVED — pin not restored
     journal.transitionBatch('IMPORTING')
     const seq = journal.intent({ type: 'session.unpin', sessionId: 'g6-pin-s0' })
     await t.workspaceRegistry.unpinSession('g6-pin-s0')
-    journal.confirm(seq, {})
+    journal.confirm(seq, { membershipAfter: { pinned: false, archived: false } })
     // THE USER archives the session afterwards (concurrent operation)
     await t.workspaceRegistry.archiveSession('g6-pin-s0')
     // rollback: our pin restore must NOT undo the user's archive
@@ -275,7 +276,7 @@ test('P2 G6 §4a: user archive after our unpin is PRESERVED — pin not restored
       journal,
     })
     assert.equal(rb.outcome, 'pending', `concurrent user archive must yield pending (got ${rb.outcome})`)
-    assert.ok(rb.conflicts.some(c => /user archived this session after our unpin/.test(c.reason)), JSON.stringify(rb.conflicts))
+    assert.ok(rb.conflicts.some(c => /membership changed after our session\.unpin/.test(c.reason)), JSON.stringify(rb.conflicts))
     assert.ok(t.workspaceRegistry.archivedSessionIds.includes('g6-pin-s0'), 'the USER archive must be preserved')
     assert.ok(!t.workspaceRegistry.pinnedSessionIds.includes('g6-pin-s0'), 'must not re-pin over the user archive')
     assert.equal(journal.state.batchState, 'ROLLBACK_PENDING', 'pending must be persisted in the journal')
@@ -448,6 +449,274 @@ test('P2 journal §1/§2/§3: init/load separation, fsync EIO aborts, snapshot g
     const open = childLoaded.state.actions.find(a => a.sessionId === 'child-s')
     assert.equal(open?.stage, 'intent', 'the intent survived the crash WITHOUT its outcome — result unknown')
   } finally {
+    rmSync(jobDir, { recursive: true, force: true })
+  }
+})
+
+// ---------------------------------------------------------------------------
+// R1–R5 review counterexamples (p2-5bbf121-review).
+// ---------------------------------------------------------------------------
+
+test('P2 R1: post-replace directory fsync failure seals the journal as durability-unknown — disk state adopted, no silent revert', async () => {
+  const jobDir = mkdtempSync(join(tmpdir(), 'r1-dur-'))
+  try {
+    const file = join(jobDir, 'j.json')
+    const binding = { instanceFingerprint: 'inst-r1', sourceDigest: 'src-r1' }
+    const j = ImportJournal.init(file, binding)
+    j.transitionBatch('PLANNED')
+    const realFsync = fs.fsyncSync
+    let calls = 0
+    fs.fsyncSync = fd => {
+      calls += 1
+      // call 1 = file content; call 2 = directory entry (post-rename). Only
+      // the FIRST directory sync fails (transient EIO) — the seal record
+      // itself must then be persisting normally.
+      if (calls === 2) { const e = new Error('injected directory EIO'); e.code = 'EIO'; throw e }
+      return realFsync(fd)
+    }
+    let caught = null
+    try {
+      j.transitionBatch('SNAPSHOT_READY')
+    } catch (error) {
+      caught = error
+    } finally {
+      fs.fsyncSync = realFsync
+    }
+    assert.ok(caught, 'the post-replace failure must surface')
+    assert.equal(caught.code, 'JOURNAL_DURABILITY_UNKNOWN', `got ${caught.code}: ${caught.message}`)
+    // The rename landed: memory must ADOPT the disk state, not pretend NEW.
+    assert.equal(j.state.batchState, 'SNAPSHOT_READY', 'memory must adopt the state that is actually on disk')
+    assert.ok(j.durabilityUnknown, 'the journal records the durability gap')
+    // Further transitions are sealed until an explicit re-check.
+    assert.throws(() => j.transitionBatch('IMPORTING'), err => err.code === 'JOURNAL_DURABILITY_UNKNOWN')
+    // A fresh process sees the same sealed record.
+    const reloaded = ImportJournal.load(file, binding)
+    assert.equal(reloaded.state.batchState, 'SNAPSHOT_READY')
+    assert.ok(reloaded.durabilityUnknown, 'the seal survives a reload')
+    // Explicit resolution re-reads the disk and clears the seal.
+    reloaded.resolveDurabilityUnknown()
+    assert.equal(reloaded.durabilityUnknown, null)
+    reloaded.transitionBatch('FAILED')
+  } finally {
+    rmSync(jobDir, { recursive: true, force: true })
+  }
+})
+
+test('P2 R2: DONE requires committed sessions, no open intents and recorded verification; failed rollback persists its verdict', async () => {
+  const jobDir = mkdtempSync(join(tmpdir(), 'r2-done-'))
+  try {
+    const file = join(jobDir, 'j.json')
+    const binding = { instanceFingerprint: 'inst-r2', sourceDigest: 'src-r2' }
+    const { computeSnapshotDigest } = await import('../lib/import/g6.js')
+    const snap = { workspaces: [], workspaceIds: [], archivedSessionIds: [], pinnedSessionIds: [], sessions: { s1: { exists: false } }, ownership: { plannedCreates: [{ id: 's1', preExisting: false }] } }
+    snap.digest = computeSnapshotDigest(snap)
+    const j = ImportJournal.init(file, binding)
+    j.transitionBatch('PLANNED')
+    j.setSnapshot(snap)
+    j.transitionBatch('SNAPSHOT_READY')
+    j.transitionBatch('IMPORTING')
+    const seq = j.intent({ type: 'session.import', sessionId: 's1' })
+    j.session('s1', 'writing')
+    j.transitionBatch('VERIFYING_TARGET')
+    // session still writing → DONE refused
+    assert.throws(() => j.transitionBatch('DONE'), /not committed/)
+    j.session('s1', 'readback-verified')
+    j.confirm(seq, { revision: 'r1' })
+    j.session('s1', 'committed', { skipReason: 'test batch plans no attachment (verified)' })
+    // committed but no recorded verification → DONE refused
+    assert.throws(() => j.transitionBatch('DONE'), /recorded successful target verification/)
+    j.recordVerification({ ok: true, diffs: [] })
+    j.transitionBatch('DONE')
+
+    // ---- failed rollback branch: the verdict is PERSISTED, not just returned.
+    const file2 = join(jobDir, 'j2.json')
+    const snap2 = { workspaces: [], workspaceIds: [], archivedSessionIds: [], pinnedSessionIds: [], sessions: { x: { exists: false } }, ownership: { plannedCreates: [{ id: 'x', preExisting: false }] } }
+    snap2.digest = computeSnapshotDigest(snap2)
+    const j2 = ImportJournal.init(file2, binding)
+    j2.transitionBatch('PLANNED')
+    j2.setSnapshot(snap2)
+    j2.transitionBatch('SNAPSHOT_READY')
+    j2.transitionBatch('IMPORTING')
+    const s2 = j2.intent({ type: 'session.import', sessionId: 'x' })
+    j2.confirm(s2, { revision: 'rX' })
+    j2.transitionBatch('ROLLING_BACK')
+    const fakePersistence = {
+      stat: async () => ({ revision: 'rX' }),
+      open: async () => ({ close: async () => {} }),
+    }
+    const rb = await rollbackBatch({
+      actions: j2.actionsReversed(),
+      snapshot: snap2,
+      plannedSessionIds: ['x'],
+      persistence: fakePersistence,
+      withdrawSession: async () => { const e = new Error('injected withdraw EIO'); e.code = 'EIO'; throw e },
+      journal: j2,
+    })
+    assert.equal(rb.outcome, 'failed')
+    assert.equal(j2.state.batchState, 'ROLLBACK_PENDING', 'a failed compensation stays resumable')
+    const reloaded = ImportJournal.load(file2, binding)
+    assert.equal(reloaded.state.rollback?.outcome, 'failed')
+    assert.ok((reloaded.state.rollback?.failures ?? []).length > 0, 'failure reasons persisted for a restart to judge')
+    assert.equal(reloaded.recovered, true)
+  } finally {
+    rmSync(jobDir, { recursive: true, force: true })
+  }
+})
+
+test('P2 R3: membership compensation restores the WHOLE before-state (unpin→pin, archive→unarchive+pin) and preserves later user pins', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
+  const { importSessionViaA } = await import('../lib/import/writer-a.js')
+  const runCase = async (setup, batchAction, between, expect) => {
+    const t = await mountTarget()
+    const jobDir = mkdtempSync(join(tmpdir(), 'r3-memb-'))
+    try {
+      const wdir = join(t.base, 'w')
+      mkdirSync(wdir, { recursive: true })
+      const W = await t.workspaceRegistry.create(wdir, 'W')
+      const s = await canonicalCandidate('r3-s', wdir)
+      await importSessionViaA(t.persistence, s)
+      await W.attachSession('r3-s')
+      await setup(t)
+      const journal = ImportJournal.init(join(jobDir, 'j.json'), { instanceFingerprint: t.instanceFingerprint, sourceDigest: 'src' })
+      const snapshot = await captureTargetPreState({ persistence: t.persistence, workspaceRegistry: t.workspaceRegistry, plannedSessionIds: ['r3-new'], relatedSessionIds: ['r3-s'] })
+      journal.transitionBatch('PLANNED')
+      journal.setSnapshot(snapshot)
+      journal.transitionBatch('SNAPSHOT_READY')
+      journal.transitionBatch('IMPORTING')
+      const seq = journal.intent({ type: batchAction, sessionId: 'r3-s' })
+      if (batchAction === 'session.unpin') await t.workspaceRegistry.unpinSession('r3-s')
+      else if (batchAction === 'session.archive') await t.workspaceRegistry.archiveSession('r3-s')
+      else if (batchAction === 'session.unarchive') await t.workspaceRegistry.unarchiveSession('r3-s')
+      else throw new Error(`unsupported batch action ${batchAction}`)
+      const after = { pinned: t.workspaceRegistry.pinnedSessionIds.includes('r3-s'), archived: t.workspaceRegistry.archivedSessionIds.includes('r3-s') }
+      journal.confirm(seq, { membershipAfter: after })
+      if (between) await between(t)
+      journal.transitionBatch('ROLLING_BACK')
+      const rb = await rollbackBatch({ actions: journal.actionsReversed(), snapshot, plannedSessionIds: ['r3-new'], workspaceRegistry: t.workspaceRegistry, persistence: t.persistence, withdrawSession: async () => {}, journal })
+      expect(rb, t)
+    } finally {
+      await t.unmount()
+      rmSync(jobDir, { recursive: true, force: true })
+    }
+  }
+
+  // case 1: pinned before → batch unpin → rollback restores the pin, complete
+  await runCase(
+    async t => { await t.workspaceRegistry.pinSession('r3-s') },
+    'session.unpin',
+    null,
+    (rb, t) => {
+      assert.equal(rb.outcome, 'complete', JSON.stringify(rb.conflicts))
+      assert.ok(rb.compensated.some(c => c.startsWith('session.unpin:r3-s')), JSON.stringify(rb.compensated))
+      assert.ok(t.workspaceRegistry.pinnedSessionIds.includes('r3-s'), 'the original pin must be RESTORED (old code skipped it)')
+    },
+  )
+
+  // case 2: pinned before → batch archive (registry drops the pin) → rollback
+  // restores archive=false AND pin=true
+  await runCase(
+    async t => { await t.workspaceRegistry.pinSession('r3-s') },
+    'session.archive',
+    null,
+    (rb, t) => {
+      assert.equal(rb.outcome, 'complete', JSON.stringify(rb.conflicts))
+      assert.ok(!t.workspaceRegistry.archivedSessionIds.includes('r3-s'), 'archive must be reverted')
+      assert.ok(t.workspaceRegistry.pinnedSessionIds.includes('r3-s'), 'the pin removed by OUR archive must be restored')
+    },
+  )
+
+  // case 3: archived before → batch unarchive → USER pins → rollback keeps
+  // the user pin and stays pending (never re-archives over it)
+  await runCase(
+    async t => { await t.workspaceRegistry.archiveSession('r3-s') },
+    'session.unarchive',
+    async t => { await t.workspaceRegistry.pinSession('r3-s') },
+    (rb, t) => {
+      assert.equal(rb.outcome, 'pending', 'a later user pin yields pending')
+      assert.ok(rb.conflicts.some(c => /membership changed after our session\.unarchive/.test(c.reason)), JSON.stringify(rb.conflicts))
+      assert.ok(t.workspaceRegistry.pinnedSessionIds.includes('r3-s'), 'the USER pin must be preserved')
+      assert.ok(!t.workspaceRegistry.archivedSessionIds.includes('r3-s'), 'must not re-archive over the user pin')
+    },
+  )
+})
+
+test('P2 R4: a user-edited title on this batch\'s new workspace preserves the registration (pending, not complete)', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
+  const t = await mountTarget()
+  const jobDir = mkdtempSync(join(tmpdir(), 'r4-title-'))
+  try {
+    const journal = ImportJournal.init(join(jobDir, 'j.json'), { instanceFingerprint: t.instanceFingerprint, sourceDigest: 'src' })
+    const snapshot = await captureTargetPreState({ persistence: t.persistence, workspaceRegistry: t.workspaceRegistry, plannedSessionIds: ['r4-new'] })
+    journal.transitionBatch('PLANNED')
+    journal.setSnapshot(snapshot)
+    journal.transitionBatch('SNAPSHOT_READY')
+    journal.transitionBatch('IMPORTING')
+    const wdir = join(t.base, 'r4-w')
+    mkdirSync(wdir, { recursive: true })
+    const seq = journal.intent({ type: 'workspace.create', workspaceId: null })
+    const W = await t.workspaceRegistry.create(wdir, '批建标题')
+    journal.confirm(seq, { workspaceId: W.id, title: W.title, path: W.path })
+    // the USER renames it afterwards
+    await W.setTitle('用户改的标题')
+    journal.transitionBatch('ROLLING_BACK')
+    const rb = await rollbackBatch({ actions: journal.actionsReversed(), snapshot, plannedSessionIds: ['r4-new'], workspaceRegistry: t.workspaceRegistry, persistence: t.persistence, withdrawSession: async () => {}, journal })
+    assert.equal(rb.outcome, 'pending', `user title change must yield pending (got ${rb.outcome})`)
+    assert.ok(rb.conflicts.some(c => /workspace title changed after our creation/.test(c.reason)), JSON.stringify(rb.conflicts))
+    const still = t.workspaceRegistry.get(W.id)
+    assert.ok(still, 'the user-renamed registration must be preserved')
+    assert.equal(still.title, '用户改的标题')
+  } finally {
+    await t.unmount()
+    rmSync(jobDir, { recursive: true, force: true })
+  }
+})
+
+test('P2 R5: an active write owner blocks withdrawal even when the revision is unchanged; a freed session withdraws normally', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
+  const t = await mountTarget()
+  const jobDir = mkdtempSync(join(tmpdir(), 'r5-owner-'))
+  try {
+    const { importSessionViaA } = await import('../lib/import/writer-a.js')
+    const journal = ImportJournal.init(join(jobDir, 'j.json'), { instanceFingerprint: t.instanceFingerprint, sourceDigest: 'src' })
+    const snapshot = await captureTargetPreState({ persistence: t.persistence, workspaceRegistry: t.workspaceRegistry, plannedSessionIds: ['r5-s'] })
+    journal.transitionBatch('PLANNED')
+    journal.setSnapshot(snapshot)
+    journal.transitionBatch('SNAPSHOT_READY')
+    journal.transitionBatch('IMPORTING')
+    const seq = journal.intent({ type: 'session.import', sessionId: 'r5-s' })
+    const s = await canonicalCandidate('r5-s', t.base)
+    const imported = await importSessionViaA(t.persistence, s)
+    journal.confirm(seq, { revision: imported.revision })
+    // a USER opens the session for writing and holds the handle (no append →
+    // revision unchanged)
+    const userHandle = await t.persistence.open('r5-s', 'write')
+    journal.transitionBatch('ROLLING_BACK')
+    let withdrawCalls = 0
+    const rb = await rollbackBatch({
+      actions: journal.actionsReversed(),
+      snapshot,
+      plannedSessionIds: ['r5-s'],
+      workspaceRegistry: t.workspaceRegistry,
+      persistence: t.persistence,
+      withdrawSession: async () => { withdrawCalls += 1 },
+      journal,
+    })
+    assert.equal(rb.outcome, 'pending', `an active owner must yield pending (got ${rb.outcome})`)
+    assert.equal(withdrawCalls, 0, 'withdrawal must not run while a write owner holds the session')
+    assert.ok(rb.conflicts.some(c => /active write owner/.test(c.reason)), JSON.stringify(rb.conflicts))
+    assert.ok(await t.persistence.stat('r5-s'), 'the session stays visible')
+    // the user finishes; a re-run of the rollback may now withdraw safely
+    await userHandle.close()
+    const rb2 = await rollbackBatch({
+      actions: journal.actionsReversed(),
+      snapshot,
+      plannedSessionIds: ['r5-s'],
+      workspaceRegistry: t.workspaceRegistry,
+      persistence: t.persistence,
+      withdrawSession: async id => { withdrawCalls += 1; const dir = t.locateDir({ cwd: s.header.cwd, id }); rmSync(join(t.sessionsRoot, dir), { recursive: true, force: true }) },
+      journal,
+    })
+    assert.equal(rb2.outcome, 'complete', JSON.stringify({ conflicts: rb2.conflicts, diffs: rb2.verification.diffs }))
+    assert.equal(withdrawCalls, 1)
+  } finally {
+    await t.unmount()
     rmSync(jobDir, { recursive: true, force: true })
   }
 })
