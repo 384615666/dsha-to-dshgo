@@ -489,3 +489,15 @@ test('P2 M4 attachment group through B: verbatim file first, session ref and byt
     await b.unmount()
   }
 })
+
+test('P2 M4 B gate: a backend without locate is refused with the stable capability code', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
+  const noLocate = {
+    stat: async () => undefined,
+    open: async () => { throw new Error('unreachable') },
+    list: async () => [],
+  }
+  const candidate = { header: { version: 4, id: 'm4-nolocate', cwd: '/w', agentPreset: 'standard' }, events: [], inheritedEventCount: 0 }
+  await assert.rejects(
+    () => publishSessionViaB({ persistence: noLocate, sessionsRoot: '/tmp/x', candidate, bytes: Buffer.alloc(0) }),
+    err => err.code === 'B_UNAVAILABLE_LOCATE')
+})
