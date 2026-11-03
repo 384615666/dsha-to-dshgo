@@ -166,7 +166,9 @@ test('P2 F8: a real runImportJob with a token-carrying storage failure leaks not
     const hits = scanForMarker({ stdout, stderr, report: JSON.stringify(report) }, token)
     assert.deepEqual(hits, [], `public channels leaked the token: ${hits}`)
     assert.ok(!String(report.error?.message ?? '').includes(token), 'the public error message must not echo the token')
-    assert.equal(report.error.code, 'SYNTHETIC_STORAGE_FAILED', 'the stable code survives for diagnostics')
+    // a raw lower-layer code is NOT a public code: only the fixed closed set
+    // from this package may pass, so the synthetic foreign code falls back.
+    assert.equal(report.error.code, 'RUNTIME_FAILURE', 'unknown foreign codes are classified to the fallback')
     assert.equal(report.error.publicTextWithheld, true)
   } finally {
     rmSync(dir, { recursive: true, force: true })
@@ -213,18 +215,24 @@ test('P2 F6 adjacent: session logs with NUL bytes refuse (binary/truncated)', as
 })
 
 // F8 residual: error.code/name/stage fields themselves must not carry the
-// runtime marker into the public report — the classifier whitelists only
-// this module's own uppercase codes.
+// runtime marker into the public report — the classifier publishes only the
+// closed set of fixed constants from this package.
 test('P2 F8 residual: raw error code/name/stage with the marker are classified out of the public report', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
   const token = runtimeMarker()
+  // FORMAT-VALID negative control: an uppercase-hex credential payload with a
+  // letter prefix (like a fake `E_...` code) satisfies the old
+  // "uppercase/digit" format filter. The closed set must still reject it.
+  const credentialLikeCode = `E${randomBytes(23).toString('hex').toUpperCase()}`
+  assert.match(credentialLikeCode, /^[A-Z][A-Z0-9_]{2,63}$/, 'precondition: the injected code passes the FORMAT filter')
   const dir = mkdtempSync(join(tmpdir(), 'f8-fields-'))
   try {
     const { runImportJob } = await import('../lib/import/job.js')
     const { ImportJournal } = await import('../lib/import/journal.js')
-    // a storage failure whose CODE (not just message) embeds the marker —
-    // simulating a lower layer that interpolates sensitive data into codes
+    // a storage failure whose CODE (not just message) embeds credential-like
+    // text — simulating a lower layer that interpolates sensitive data into
+    // codes while keeping a format the old classifier accepted
     const failingPersistence = {
-      stat: async () => { const e = new Error('boom'); e.code = `E_${token}`; e.stage = `stage-${token}`; throw e },
+      stat: async () => { const e = new Error(`boom ${token}`); e.code = credentialLikeCode; e.stage = `stage-${token}`; throw e },
       open: async () => { throw new Error('unreachable') },
       list: async () => [],
     }
@@ -267,9 +275,36 @@ test('P2 F8 residual: raw error code/name/stage with the marker are classified o
     assert.equal(report.status, 'FAILED')
     const hits = scanForMarker({ stdout, stderr, report: JSON.stringify(report) }, token)
     assert.deepEqual(hits, [], `raw code/name/stage leaked the marker: ${hits}`)
-    assert.match(report.error.code, /^[A-Z][A-Z0-9_]{2,63}$/, 'the public code must be whitelist-classified')
-    assert.ok(!String(report.error.code).includes(token))
+    assert.equal(report.error.code, 'RUNTIME_FAILURE', 'a format-valid but UNKNOWN code must not be published')
+    assert.notEqual(report.error.code, credentialLikeCode)
+    assert.equal(report.error.stage, undefined, 'stage never enters the public report')
+    assert.equal(report.error.name, undefined, 'name never enters the public report')
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
+})
+
+test('P2 F8: public error classification is a CLOSED SET (known constants only)', async () => {
+  const { PUBLIC_ERROR_CODES, publicErrorCode } = await import('../lib/import/public-codes.js')
+  // the set is explicit, non-trivial and entirely format-valid fixed text
+  assert.ok(PUBLIC_ERROR_CODES.length > 40, `expected the full known-code set, got ${PUBLIC_ERROR_CODES.length}`)
+  for (const code of PUBLIC_ERROR_CODES) {
+    assert.match(code, /^[A-Z][A-Z0-9_]{2,63}$/)
+  }
+  // known package constants pass through unchanged
+  assert.equal(publicErrorCode({ code: 'IMPORT_PLAN_BINDING' }), 'IMPORT_PLAN_BINDING')
+  assert.equal(publicErrorCode({ code: 'G6_SNAPSHOT_CORRUPT' }), 'G6_SNAPSHOT_CORRUPT')
+  // NEGATIVE CONTROL: format-valid but not in the set → fallback. An
+  // uppercase-hex credential with a letter prefix satisfied the old
+  // format-only filter.
+  const credentialLike = `E${randomBytes(23).toString('hex').toUpperCase()}`
+  assert.match(credentialLike, /^[A-Z][A-Z0-9_]{2,63}$/, 'precondition: passes the old format filter')
+  assert.equal(publicErrorCode({ code: credentialLike }), 'RUNTIME_FAILURE')
+  assert.equal(publicErrorCode({ code: credentialLike }, 'ROLLBACK_FAILURE'), 'ROLLBACK_FAILURE')
+  // format-valid unknown non-credential code also falls back
+  assert.equal(publicErrorCode({ code: 'SOME_FUTURE_CODE' }), 'RUNTIME_FAILURE')
+  // non-string / missing codes
+  assert.equal(publicErrorCode({}), 'RUNTIME_FAILURE')
+  assert.equal(publicErrorCode({ code: 42 }), 'RUNTIME_FAILURE')
+  assert.equal(publicErrorCode({ code: null }), 'RUNTIME_FAILURE')
 })
