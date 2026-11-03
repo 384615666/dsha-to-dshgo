@@ -6,23 +6,28 @@
 
 ## 中文
 
-把 **DSHA**（DeepSeek Harness Android 端）「一键备份」导出的会话备份，迁移到 **dsh-Go** 的 DSH bundle 插件。迁移完成后，会话直接出现在 dsh-Go 原生会话列表中：正文、工具历史、标题可读，重启后仍在，可继续发消息。
+把 **DSHA**（DeepSeek Harness Android 端）「一键备份」导出的会话备份，迁移到 **dsh-Go** 的 DSH bundle 插件。迁移完成后，会话出现在 dsh-Go 的工作区中：正文、工具历史、preset 与时间线保留，可继续对话。
 
-- 不改 APK、不 Root、不 ADB 私有目录拷贝、不用电脑端工具作为最终方案。
-- 插件只处理用户明确选择的备份文件；**所有解析、暂存与写入都发生在设备本机**，不联网上传任何聊天数据。
-- 备份内包含的 `.credentials.yaml` 等敏感配置**默认不迁移**，不写入报告，不打印内容。
+- 不改 APK、不 Root、不 ADB 私有目录拷贝、不以电脑端工具作为最终产品。
+- 只处理用户明确选择的备份文件；**解析、暂存与写入都在设备本机完成**，不联网上传聊天数据。
+- 备份内的 `.credentials.yaml` 等敏感配置**只做完整性校验，不迁移、不写报告、不打印内容**。
+- 源备份只读；不覆盖目标已有会话 ID；导入使用独立的新工作区，不改既有工作区。
 
-### 当前状态：P0（能力验证原型）
+### 当前状态
 
-本仓库当前是 P0 纵向原型，已验证并附真实证据（桌面隔离 Host + 真机 Android/ARM64 PRoot，引擎 `0.2.1-rc.4`）：
+已实现并通过桌面隔离引擎与真实备份验证：
 
-- 运行时能力检查：`session-persistence-jsonl` 后端、`locate()` 可用（文件落位路径可行）。
-- **A 路径**（服务重放）：`create/append/flush/close → open(read)` 完整读回哈希一致；改用新 session ID 会被 delivery-marker 校验拒绝（因此迁移保留源 ID）。
-- **B 路径**（文件落位）：由实例自身 `locate()` 计算路径落位，运行中 `list()` 即时可见，重启后仍可读。
-- G6 最小快照/回滚：通过 workspace registry 自身 API 补偿可恢复到导入前状态。
-- 真机输入通道：系统 files 选择器（≤8 MiB）与 `/sdcard` 流式读取（>8 MiB）均通过，SHA-256 与原件一致。
+- **输入**：DSHA v5 一键备份（gzip magic 识别，接受 `..gz` 等扩展名）；系统 files 选择器（≤8 MiB）路径。
+- **解析/恢复**：整包校验、白名单暂存、官方历史迁移链（v0–v3 → v4）、父子 catalog 绑定、官方 locate 位置校验。
+- **写入（A 路径）**：官方 `sessionPersistence.create/append/flush/close` + 全量语义读回；保留源会话 ID。
+- **附件**：附件先行发布（图片逐字节、文件 verbatim），官方读回后才创建会话；借用对象不撤回。
+- **安全**：G6 工作区完整单元快照、批准计划内容门禁、journal 持久化、受保护撤回回滚、用户改名/追加/新增引用保留并 pending。
+- **原生面板**：选择备份 → 校验进度 → 分页选择会话 → preset/cwd 映射 → 确认计划 → 开始/取消 → 结果与恢复。P0 探针收在「开发工具」里。
+- **重复导入**：相同备份重跑会重新核验目标；一致显示「已完成」，目标被修改则要求恢复判断，不会静默追加。
 
-尚未实现：完整备份解析（P1）、端到端迁移与回滚（P2）、正式 UI（P3）、npm 发布（P4/P5）。开发路线与验收标准见内部规划文档（不含于本仓库）。
+验证基线：`160` 项自动化测试（隔离 rc.4 引擎与真实备份夹具；三组环境分别运行）；SDK 清单/半宿主加载/中英文面板通过；npm 包门禁通过。旧代（v0–v3）只有合成夹具证据，**未在真实用户旧数据上验证**。
+
+**尚未完成/未放行**：真机上的原生列表标题、重启后读取、真实续聊与真实模型验收；B 路径仍是实验入口，未接入统一作业；npm 发布与市场真实安装未执行。当前版本不要作为唯一数据副本使用。
 
 ### 开发期安装（dsh-Go，无需 Root）
 
@@ -36,7 +41,14 @@ dsh plugin --profile web add /root/.dsh/dsh-go/plugins/dsh-dsha-migrator
 # 然后在 App 的「引擎」页重启内核
 ```
 
-### P0 探针专用环境变量（仅隔离实验使用）
+### 数据与隐私
+
+- 作业数据保存在 `<DSH_HOME>/dsha-migrator/`（journal、冻结计划、内容寻址快照、隔离区），文件 0600 / 目录 0700。
+- 导入成功后删除私有输入副本与候选暂存；journal/快照作为恢复点保留。
+- 失败/取消按 G6 与受保护撤回补偿；无法判定的对象保持 pending 并保留最小证据。
+- 卸载插件不影响已导入的会话。
+
+### 开发探针环境变量（仅隔离实验）
 
 | 变量 | 用途 |
 |---|---|
@@ -47,18 +59,10 @@ dsh plugin --profile web add /root/.dsh/dsh-go/plugins/dsh-dsha-migrator
 | `DSHA_MIGRATOR_P0_SCAN_DIR` | 输入通道扫描目录（默认 `/sdcard/Download/DSHA`） |
 | `DSHA_MIGRATOR_P0_AUTOWRITE=1` / `DSHA_MIGRATOR_P0_AUTOB=1` / `DSHA_MIGRATOR_P0_AUTOG6=1` | 启动时自动执行对应探针（仅隔离环境） |
 
-面板提供能力检查 / A / B / G6 探针与两个输入通道动作；所有探针结果以 JSON 报告落盘（0600/0700），不打印聊天内容。
-
 ### 兼容性
 
-- 目标引擎：`>=0.2.1-rc.4 <0.3.0-0`（证据基线为 rc.4）；App `minApp 1.0.4`（已在 1.0.7 实测）。
-- 输入：DSHA 一键备份 v5（按 gzip magic 识别，接受 `..gz` 等非常规扩展名）；会话格式 v0–v4 直接支持在路线图中（旧代经 dsh-Go 自带迁移链升级为 v4）。
-
-### 数据与隐私
-
-- 插件运行数据保存在 `<DSH_HOME>/migrations/dsha-migrator/`（文件 0600 / 目录 0700）。
-- 源备份只读；迁移不修改 DSHA 数据。
-- 卸载插件不影响已导入的会话。
+- 目标引擎：`>=0.2.1-rc.4 <0.3.0-0`（证据基线为 rc.4）；App `minApp 1.0.4`（1.0.7 实测）。
+- 输入：DSHA 一键备份 v5；会话格式 v0–v4 经 dsh-Go 自带迁移链升级为 v4。
 
 ### 许可
 
@@ -68,10 +72,47 @@ dsh plugin --profile web add /root/.dsh/dsh-go/plugins/dsh-dsha-migrator
 
 ## English
 
-A DSH bundle plugin that migrates sessions from a **DSHA** one-click backup into **dsh-Go**. Migrated sessions appear in the native dsh-Go session list with full message/tool history, survive restarts, and can continue chatting.
+A DSH bundle plugin that migrates sessions from a **DSHA** one-click backup into **dsh-Go**. Migrated sessions live in a dedicated workspace with their message/tool history, preset and timeline; they can be continued after import.
 
-**Status: P0 prototype.** Verified against a real isolated rc.4 Host and a real Android (ARM64 PRoot) device: runtime capability check (`locate` available), A-path service replay (full readback hash match; renaming session IDs is rejected by delivery-marker validation — the migration preserves source IDs), B-path file placement (immediately visible in `list()`, readable after restart), minimal G6 snapshot/rollback, and both input channels (system files picker ≤8 MiB and `/sdcard` streaming >8 MiB, SHA-256 verified).
+- No APK modification, no root, no private ADB pulls, and no desktop-only final product.
+- Only the backup the user selects is read; parsing, staging and writing happen **on the device**, with no upload of chat data.
+- Sensitive files inside the backup (`.credentials.yaml` etc.) are integrity-checked only: never migrated, reported or printed.
 
-Not yet implemented: full backup parsing (P1), end-to-end migration with rollback (P2), production UI (P3), npm publishing (P4/P5).
+### Status
 
-Everything runs on-device: chat data is never uploaded. Sensitive files inside the backup (`.credentials.yaml` etc.) are never migrated or logged. See [LICENSE](./LICENSE) (MIT).
+Implemented and verified against an isolated rc.4 engine with a real backup:
+
+- **Input**: DSHA v5 backup (gzip magic, accepts `..gz`); system files picker path (≤8 MiB).
+- **Parsing/restore**: full archive verification, allowlisted staging, official historical chain (v0–v3 → v4), parent/child catalog binding, official `locate()` location verification.
+- **A-path write**: official `create/append/flush/close` plus full semantic readback; source session IDs preserved.
+- **Attachments**: published before sessions (images byte-for-byte, files verbatim), official readback before create; borrowed objects are never withdrawn.
+- **Safety**: complete G6 workspace-unit snapshot, approved-plan content gate, durable journal, protected withdrawal rollback, user edits/additions/new references preserved as pending.
+- **Native panel**: pick backup → verify progress → paginated session selection → preset/cwd mapping → approve plan → start/cancel → result and recovery. P0 probes remain under Dev tools.
+- **Repeat import**: the same backup re-verifies the target; identical content reports done, a changed target requires recovery instead of silent appends.
+
+Baseline: `160` automated tests across three environments; SDK manifest/half-host load/zh-en panels pass; the npm package gate passes. Historical generations (v0–v3) have synthetic fixtures only — **not validated against real user legacy data**.
+
+**Not released yet**: native list titles, restart, real chat continuation and real-model acceptance on a physical device; B path remains an experimental entry and is not wired into the job; npm publishing and market installation are not done. Do not use this version as the only copy of your data.
+
+### Development install (no root)
+
+```sh
+# desktop web profile
+dsh plugin --profile web add /path/to/dsh-dsha-migrator
+
+# on-device engine (run in the App terminal; copy the plugin folder to phone storage first)
+cp -r /sdcard/Download/dsh-dsha-migrator /root/.dsh/dsh-go/plugins/
+dsh plugin --profile web add /root/.dsh/dsh-go/plugins/dsh-dsha-migrator
+# then restart the kernel from the App engine page
+```
+
+### Data and privacy
+
+- Job data lives under `<DSH_HOME>/dsha-migrator/` (journal, frozen plan, content-addressed snapshot, quarantine), files 0600 / directories 0700.
+- On success the private input copy and candidate staging are removed; the journal/snapshot stay as the recovery point.
+- Failure/cancel compensates through G6 and protected withdrawal; undecidable objects stay pending with minimal evidence.
+- Uninstalling the plugin does not affect imported sessions.
+
+### License
+
+[MIT](./LICENSE)
