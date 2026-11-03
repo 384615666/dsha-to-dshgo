@@ -14,6 +14,7 @@ import { createRequire } from 'node:module'
 import { pathToFileURL } from 'node:url'
 import fs from 'node:fs'
 import zlib from 'node:zlib'
+import { spawnSync } from 'node:child_process'
 import { importSessionViaA } from '../lib/import/writer-a.js'
 import { publishSessionViaB, verifyAppendCapability, hasLocateCapability } from '../lib/import/writer-b.js'
 import { collectAttachmentDependencies, planAttachmentPublication, publishAttachments } from '../lib/import/attachments.js'
@@ -50,6 +51,20 @@ async function mountTarget() {
     async unmount() {
       try { await ctx.fiber?.dispose?.() } catch { /* best effort */ }
       rmSync(base, { recursive: true, force: true })
+    },
+  }
+}
+
+// Mount ONLY the JSONL backend on an EXISTING root (crash/restart checks).
+async function mountAt(sessionsRoot) {
+  const jsonl = await importPkg('@deepseek-ai/dsh-session-persistence-jsonl')
+  const { Context } = await importPkg('@deepseek-ai/cordis')
+  const ctx = new Context()
+  await ctx.plugin(jsonl, { root: sessionsRoot, compression: 'zstd' })
+  return {
+    persistence: ctx.sessionPersistence,
+    async unmount() {
+      try { await ctx.fiber?.dispose?.() } catch { /* best effort */ }
     },
   }
 }
@@ -93,9 +108,10 @@ const APPEND = (id, startSeq, turn) => [
   { type: 'turn/end', seq: startSeq + 2, time: 9_002, data: { turn, reason: { kind: 'completed' } } },
 ]
 
-// A mock Agent turn: the official write handle receives a complete turn
-// (start → step/start → user → assistant → step/end → end) exactly as a
-// continuing agent would. The released v4 lifecycle requires an open step
+// A hand-built complete turn appended through the official write handle.
+// This is LOG-LEVEL append/readback coverage — it does NOT drive the official
+// Agent lifecycle (see import-agent-resume.test.js for the real resume +
+// mock-provider acceptance). The released v4 lifecycle requires an open step
 // for assistant/message — a bare message is rejected by the official decoder.
 const MOCK_TURN = (id, startSeq, turn) => [
   { type: 'turn/start', seq: startSeq, time: 9_100, data: { turn } },
@@ -197,7 +213,7 @@ test('P2 M4 real v4 two-session matrix (596/454): A and B preserve semantics and
   }
 })
 
-test('P2 M4 mock Agent continues a REAL imported session; a fresh instance reads the full continuation', { skip: realSkip ? 'DSHA_V5_REAL or RC4_MODULES not set' : false }, async () => {
+test('P2 M4 manual complete-turn append: a real imported session accepts a full turn and a fresh instance reads it', { skip: realSkip ? 'DSHA_V5_REAL or RC4_MODULES not set' : false }, async () => {
   const dir = mkdtempSync(join(tmpdir(), 'm4-agent-'))
   const a = await mountTarget()
   try {
@@ -500,4 +516,122 @@ test('P2 M4 B gate: a backend without locate is refused with the stable capabili
   await assert.rejects(
     () => publishSessionViaB({ persistence: noLocate, sessionsRoot: '/tmp/x', candidate, bytes: Buffer.alloc(0) }),
     err => err.code === 'B_UNAVAILABLE_LOCATE')
+})
+
+test('P2 M4 B short write: a partial writeSync return is completed, never published truncated', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
+  const b = await mountTarget()
+  const origWriteSync = fs.writeSync
+  try {
+    const { candidate, bytes } = await syntheticCandidate('m4-b-short', b.base)
+    let calls = 0
+    fs.writeSync = (fd, data, ...rest) => {
+      calls += 1
+      if (calls === 1) return origWriteSync(fd, Buffer.from(data), 0, 5)
+      return origWriteSync(fd, data, ...rest)
+    }
+    const res = await publishSessionViaB({ persistence: b.persistence, sessionsRoot: b.sessionsRoot, candidate, bytes })
+    assert.ok(calls > 1, 'the writer must continue after a short write')
+    assert.equal(res.steps.publish.stagedBytes, Buffer.byteLength(bytes))
+    const read = await readAll(b.persistence, candidate.header.id)
+    assert.equal(read.events.length, candidate.events.length, 'the complete candidate is visible')
+    assert.equal(sha(read.events), sha(candidate.events))
+  } finally {
+    fs.writeSync = origWriteSync
+    await b.unmount()
+  }
+})
+
+test('P2 M4 B competes with the target service create: exactly one owner, never an overwrite', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
+  const b = await mountTarget()
+  try {
+    const { candidate, bytes } = await syntheticCandidate('m4-b-svc', b.base)
+    const publish = publishSessionViaB({ persistence: b.persistence, sessionsRoot: b.sessionsRoot, candidate, bytes })
+      .then(value => ({ kind: 'b', value }), error => ({ kind: 'b-error', error }))
+    const create = b.persistence.create({ ...candidate.header }, { inheritedEventCount: 0 })
+      .then(handle => ({ kind: 'create', handle }), error => ({ kind: 'create-error', error }))
+    const [pb, pc] = await Promise.all([publish, create])
+    const successes = [pb, pc].filter(x => x.kind === 'b' || x.kind === 'create')
+    assert.equal(successes.length, 1, 'exactly one publication/creation owns the id')
+    if (pc.kind === 'create') {
+      try {
+        const read = await readAll(b.persistence, candidate.header.id)
+        assert.equal(read.events.length, 0, 'the service-created session is the visible owner')
+      } finally {
+        await pc.handle.close()
+      }
+      assert.equal(pb.kind, 'b-error')
+      assert.equal(pb.error.code, 'B_ID_CONFLICT')
+    } else {
+      assert.equal(pb.kind, 'b')
+      assert.equal(pc.kind, 'create-error')
+      const read = await readAll(b.persistence, candidate.header.id)
+      assert.equal(sha(read.events), sha(candidate.events))
+    }
+  } finally {
+    await b.unmount()
+  }
+})
+
+test('P2 M4 B crash safety: a process exit during staging leaves no visible session; a fresh instance publishes cleanly', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'm4-b-crash-'))
+  const sessionsRoot = join(dir, 'sessions')
+  mkdirSync(sessionsRoot, { recursive: true })
+  try {
+    const { candidate, bytes } = await syntheticCandidate('m4-b-crash', dir)
+    const payloadFile = join(dir, 'payload.json')
+    writeFileSync(payloadFile, JSON.stringify({
+      sessionsRoot,
+      header: candidate.header,
+      bytesBase64: Buffer.from(bytes).toString('base64'),
+    }))
+    const childFile = join(dir, 'crash-writer.mjs')
+    const pluginRoot = join(import.meta.dirname, '..')
+    writeFileSync(childFile, `
+import fs from 'node:fs'
+import { readFileSync } from 'node:fs'
+import { createRequire } from 'node:module'
+import { pathToFileURL } from 'node:url'
+const [payloadPath, rc4, pluginRoot] = process.argv.slice(2)
+const req = createRequire(rc4 + '/noop.js')
+const jsonl = await import(pathToFileURL(req.resolve('@deepseek-ai/dsh-session-persistence-jsonl')).href)
+const { Context } = await import(pathToFileURL(req.resolve('@deepseek-ai/cordis')).href)
+const { publishSessionViaB } = await import(pathToFileURL(pluginRoot + '/lib/import/writer-b.js').href)
+const payload = JSON.parse(readFileSync(payloadPath, 'utf8'))
+const ctx = new Context()
+await ctx.plugin(jsonl, { root: payload.sessionsRoot, compression: 'zstd' })
+const orig = fs.writeSync
+fs.writeSync = (fd, data) => {
+  orig(fd, Buffer.from(data).subarray(0, 10))
+  process.exit(73)
+}
+await publishSessionViaB({
+  persistence: ctx.sessionPersistence,
+  sessionsRoot: payload.sessionsRoot,
+  candidate: { header: payload.header, events: [], inheritedEventCount: 0 },
+  bytes: Buffer.from(payload.bytesBase64, 'base64'),
+})
+process.exit(0)
+`)
+    const child = spawnSync(process.execPath, [childFile, payloadFile, rc4Dir, pluginRoot], { encoding: 'utf8', timeout: 120_000 })
+    assert.equal(child.status, 73, `child must exit mid-write (stderr: ${child.stderr?.slice(0, 300)})`)
+    const mounted = await mountAt(sessionsRoot)
+    try {
+      // No fresh instance may see a session the crashed publisher never
+      // completed; only an ignored non-canonical temp entry may remain.
+      assert.equal(await mounted.persistence.stat(candidate.header.id), undefined, 'stat must not see the crashed publication')
+      const list = await mounted.persistence.list()
+      assert.equal(list.some(x => x.header.id === candidate.header.id), false, 'list must not see the crashed publication')
+      const located = mounted.persistence.locate({ cwd: candidate.header.cwd, id: candidate.header.id })
+      assert.equal(statSync(located.path, { throwIfNoEntry: false }), undefined, 'the canonical path was never created')
+      // The namespace is still usable: a full publication succeeds afterwards.
+      const res = await publishSessionViaB({ persistence: mounted.persistence, sessionsRoot, candidate, bytes })
+      assert.equal(res.steps.readback.ok, true)
+      const read = await readAll(mounted.persistence, candidate.header.id)
+      assert.equal(sha(read.events), sha(candidate.events))
+    } finally {
+      await mounted.unmount()
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
 })

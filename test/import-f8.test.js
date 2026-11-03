@@ -15,6 +15,7 @@ import { spawnSync } from 'node:child_process'
 import { captureTargetPreState } from '../lib/import/g6.js'
 import { sanitizeRoots } from '../lib/inspect-sessions.js'
 import { ImportJournal } from '../lib/import/journal.js'
+import { planContentDigest } from '../lib/import/plan.js'
 
 const rc4Dir = process.env.RC4_MODULES
 const skip = !rc4Dir
@@ -133,13 +134,13 @@ test('P2 F8: a real runImportJob with a token-carrying storage failure leaks not
     const jobDir = join(dir, 'job')
     mkdirSync(jobDir, { recursive: true })
     const approvedPlan = {
-      digest: '0'.repeat(64),
       sourceDigest: 'src-f8',
       target: { instanceFingerprint: 'inst-f8' },
       selected: ['f8-s'],
       excluded: [],
       sessions: [],
     }
+    approvedPlan.digest = planContentDigest(approvedPlan)
     const journal = ImportJournal.init(join(jobDir, 'journal.json'), { instanceFingerprint: 'inst-f8', sourceDigest: 'src-f8' }, { requirePlanApproval: true })
     journal.approvePlan({ digest: approvedPlan.digest })
     journal.transitionBatch('PLANNED')
@@ -248,13 +249,13 @@ test('P2 F8 residual: raw error code/name/stage with the marker are classified o
     const jobDir = join(dir, 'job')
     mkdirSync(jobDir, { recursive: true })
     const approvedPlan = {
-      digest: '0'.repeat(64),
       sourceDigest: 'src-f8b',
       target: { instanceFingerprint: 'inst-f8b' },
       selected: ['f8b-s'],
       excluded: [],
       sessions: [],
     }
+    approvedPlan.digest = planContentDigest(approvedPlan)
     const journal = ImportJournal.init(join(jobDir, 'journal.json'), { instanceFingerprint: 'inst-f8b', sourceDigest: 'src-f8b' }, { requirePlanApproval: true })
     journal.approvePlan({ digest: approvedPlan.digest })
     journal.transitionBatch('PLANNED')

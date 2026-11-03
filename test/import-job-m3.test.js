@@ -630,6 +630,74 @@ test("P2 M4 mapping: the approved plan's cwdMapping rewrites the write header, n
     const user = events.find(e => e.type === 'user/message')
     assert.equal(user.data.content[0].text, 'M3 m4-map', 'message text is never rewritten')
     assert.equal(s1.header.cwd, sourceCwd, 'the caller candidate object is not mutated')
+
+    // R2: the SAME approved plan and the ORIGINAL source-header candidate must
+    // re-verify as identical — the entry applies the approved mapping to every
+    // classification path, not only to the first write.
+    const actionsBefore = JSON.parse(readFileSync(join(jobDir, 'journal.json'), 'utf8')).actions.length
+    const retry = await runImportJob({
+      jobDir,
+      instanceLockDir: join(jobDir, 'lock'),
+      instanceFingerprint: 'inst-map',
+      sourceDigest: 'src-map',
+      approvedPlan: plan,
+      target: t,
+      sessions: [s1],
+      withdrawSession: async () => {},
+      allowUnprotected: true,
+    })
+    assert.equal(retry.status, 'ALREADY_DONE', JSON.stringify(retry))
+    assert.equal(retry.sessions[0]?.classification, 'identical')
+    assert.equal(JSON.parse(readFileSync(join(jobDir, 'journal.json'), 'utf8')).actions.length, actionsBefore, 'an identical re-run performs no new action')
+
+    // R2: a mapping that differs from the persisted approved version (stale
+    // digest) is never silently accepted.
+    const tampered = { ...plan, cwdMapping: { [sourceCwd]: join(t.base, 'other-target') } }
+    const refused = await runImportJob({
+      jobDir,
+      instanceLockDir: join(jobDir, 'lock'),
+      instanceFingerprint: 'inst-map',
+      sourceDigest: 'src-map',
+      approvedPlan: tampered,
+      target: t,
+      sessions: [s1],
+      withdrawSession: async () => {},
+      allowUnprotected: true,
+    })
+    assert.equal(refused.status, 'FAILED')
+    // A changed mapping breaks the plan content digest; the persisted
+    // approved version cannot be matched either way.
+    assert.ok(['PLAN_CORRUPT', 'JOURNAL_PLAN_MISMATCH'].includes(refused.error?.code), JSON.stringify(refused.error))
+    assert.equal(JSON.parse(readFileSync(join(jobDir, 'journal.json'), 'utf8')).actions.length, actionsBefore, 'refused mapping performs no action')
+
+    // R2: a genuine target change (user continuation) is still detected — the
+    // unchanged plan does not claim the extended log as identical.
+    const turn = 2
+    const start = events.length
+    const write = await t.persistence.open('m4-map', 'write')
+    try {
+      await write.append([
+        { type: 'turn/start', seq: start, time: 9_000, data: { turn } },
+        { type: 'user/message', seq: start + 1, time: 9_001, data: { id: 'm4-map-u2', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'user continuation' }] }, surfaceOp: 'append' },
+        { type: 'turn/end', seq: start + 2, time: 9_002, data: { turn, reason: { kind: 'completed' } } },
+      ])
+      await write.flush()
+    } finally {
+      await write.close()
+    }
+    const changed = await runImportJob({
+      jobDir,
+      instanceLockDir: join(jobDir, 'lock'),
+      instanceFingerprint: 'inst-map',
+      sourceDigest: 'src-map',
+      approvedPlan: plan,
+      target: t,
+      sessions: [s1],
+      withdrawSession: async () => {},
+      allowUnprotected: true,
+    })
+    assert.equal(changed.status, 'RECOVERY_REQUIRED')
+    assert.equal(changed.recovery?.classification, 'prefix-extended', 'a target continuation is preserved, not silently reused')
   } finally {
     await t.unmount()
     rmSync(jobDir, { recursive: true, force: true })
