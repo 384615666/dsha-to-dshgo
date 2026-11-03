@@ -330,7 +330,7 @@ test('P2 M4 B namespace competition: a foreign file at the locate path is never 
       code = error.code
     }
     assert.equal(threw, true, 'the publication must refuse a pre-existing namespace entry')
-    assert.ok(['B_ID_CONFLICT', 'B_IO', 'B_READBACK_MISMATCH'].includes(code), `stable refusal code, got ${code}`)
+    assert.equal(code, 'B_ID_CONFLICT', 'an unreadable namespace entry is classified as an occupied id')
     assert.deepEqual(readFileSync(located.path), foreign, 'the foreign file is byte-identical (never overwritten)')
   } finally {
     await b.unmount()

@@ -4,7 +4,7 @@
 // rollback with protected withdrawal; cancellation; RECOVERY_REQUIRED.
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, relative, sep } from 'node:path'
 import { createHash } from 'node:crypto'
@@ -165,6 +165,9 @@ test('P2 M3 run: attachments published BEFORE sessions, readback verified, works
     // journal terminal
     const reloaded = ImportJournal.load(journalFile, { instanceFingerprint: 'inst-m3', sourceDigest: 'src-m3' })
     assert.equal(reloaded.state.batchState, 'DONE')
+    // M5 cleanup: a successful batch never withdraws anything, so no
+    // quarantine object may exist; only the journal/plan/snapshot remain.
+    assert.equal(existsSync(join(jobDir, 'quarantine')), false, 'no quarantine directory for a successful batch')
   } finally {
     await t.unmount()
     rmSync(jobDir, { recursive: true, force: true })
