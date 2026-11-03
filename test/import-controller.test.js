@@ -158,14 +158,19 @@ test('P3 controller: real backup → preview → approved plan → DONE → repe
     assert.equal(snap.result?.status, 'ALREADY_DONE', JSON.stringify(snap))
     assert.equal(snap.phase, 'already_done')
 
-    // A removed committed session is a target discrepancy, not a silent pass.
+    // A removed/changed committed session is a COMPLETED-batch target
+    // discrepancy, not a rollback candidate: there are no open intents. The
+    // panel reports a terminal target-modified result instead of pretending a
+    // recovery rollback is pending.
     const located = engine.persistence.locate({ cwd: targetCwd, id: ids[0] })
     rmSync(join(located.path, '..'), { recursive: true, force: true })
     await controller.preparePath(realBackup)
     await controller.start()
     snap = controller.snapshot()
-    assert.equal(snap.result?.status, 'RECOVERY_REQUIRED')
-    assert.equal(snap.phase, 'recovery_required')
+    assert.equal(snap.result?.status, 'TARGET_MODIFIED')
+    assert.equal(snap.phase, 'target_modified')
+    assert.equal(snap.canPurge, true)
+    assert.equal(snap.recovery, null)
   } finally {
     if (oldData === undefined) delete process.env.DSHA_MIGRATOR_DATA_DIR
     else process.env.DSHA_MIGRATOR_DATA_DIR = oldData
