@@ -104,9 +104,9 @@ async function candidate(id, cwd, { fileBytes = null, withWorkspace = true } = {
   }
 }
 
-async function approvedPlanFor(dir, sessions, { sourceDigest = 'src-m3', instanceFingerprint = 'inst-m3' } = {}) {
+async function approvedPlanFor(dir, sessions, { sourceDigest = 'src-m3', instanceFingerprint = 'inst-m3', cwdMapping = {} } = {}) {
   const report = { sessions: sessions.map(s => ({ id: s.id, status: 'restored', importable: true, sourceGeneration: 4, headerVersion: 4 })), counts: { total: sessions.length } }
-  const plan = buildPlan({ sourceDigest, instanceFingerprint, report })
+  const plan = buildPlan({ sourceDigest, instanceFingerprint, report, cwdMapping })
   const file = join(dir, 'plan.json')
   freezePlan(file, plan)
   return { plan, file }
@@ -583,5 +583,52 @@ test('P2 F1/F2/F3: late-present corrupt file refuses with no dangling intent; us
   } finally {
     await t3.unmount()
     rmSync(jobDir3, { recursive: true, force: true })
+  }
+})
+
+test("P2 M4 mapping: the approved plan's cwdMapping rewrites the write header, never message text", { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
+  const t = await mountEngine()
+  const jobDir = mkdtempSync(join(tmpdir(), 'm3-map-'))
+  try {
+    const sourceCwd = '/source/original-project'
+    const targetCwd = join(t.base, 'mapped-target')
+    mkdirSync(targetCwd, { recursive: true })
+    const s1 = await candidate('m4-map', sourceCwd, { withWorkspace: false })
+    const { plan } = await approvedPlanFor(jobDir, [s1], {
+      sourceDigest: 'src-map',
+      instanceFingerprint: 'inst-map',
+      cwdMapping: { [sourceCwd]: targetCwd },
+    })
+    const journal = ImportJournal.init(join(jobDir, 'journal.json'), { instanceFingerprint: 'inst-map', sourceDigest: 'src-map' }, { requirePlanApproval: true })
+    journal.approvePlan({ digest: plan.digest, file: join(jobDir, 'plan.json') })
+    journal.transitionBatch('PLANNED')
+    const result = await runImportJob({
+      jobDir,
+      instanceLockDir: join(jobDir, 'lock'),
+      instanceFingerprint: 'inst-map',
+      sourceDigest: 'src-map',
+      approvedPlan: plan,
+      target: t,
+      sessions: [s1],
+      withdrawSession: async () => {},
+      allowUnprotected: true,
+    })
+    assert.equal(result.status, 'DONE', JSON.stringify(result))
+    const read = await t.persistence.open('m4-map', 'read')
+    let header
+    let events
+    try {
+      header = read.header
+      events = (await read.read()).events
+    } finally {
+      await read.close()
+    }
+    assert.equal(header.cwd, targetCwd, 'the write header carries the approved mapping')
+    const user = events.find(e => e.type === 'user/message')
+    assert.equal(user.data.content[0].text, 'M3 m4-map', 'message text is never rewritten')
+    assert.equal(s1.header.cwd, sourceCwd, 'the caller candidate object is not mutated')
+  } finally {
+    await t.unmount()
+    rmSync(jobDir, { recursive: true, force: true })
   }
 })

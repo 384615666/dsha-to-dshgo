@@ -102,6 +102,15 @@ async function buildCandidate(kind, id, cwd) {
   } else if (kind === 'attachment-file') {
     // built by the caller with the file ref already embedded
     logical = null
+  } else if (kind === 'empty') {
+    // a CURRENT v4 session with a header and zero events: the official
+    // backend accepts an empty session (probed), so the import gates must too.
+    return {
+      id,
+      header: { version: 4, id, createdAt: 1793500000000, cwd, isSeeded: false, delegationDepth: 0, agentPreset: preset },
+      events: [],
+      inheritedEventCount: 0,
+    }
   } else {
     logical = [
       e('turn/start', 0, { turn: 1 }),
@@ -151,9 +160,9 @@ const APPEND = (id, startSeq, turn) => [
   { type: 'turn/end', seq: startSeq + 2, time: 9_002, data: { turn, reason: { kind: 'completed' } } },
 ]
 
-const MATRIX_CASES = ['plain', 'compaction', 'seeded', 'preset-preserved']
+const MATRIX_CASES = ['plain', 'compaction', 'seeded', 'preset-preserved', 'empty']
 
-test('P2 M4 extended A/B matrix: compaction/seeded/preset-preserved/plain satisfy the same gates on both paths', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
+test('P2 M4 extended A/B matrix: plain/compaction/seeded/preset-preserved/empty satisfy the same gates on both paths', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
   const matrix = []
   for (const kind of MATRIX_CASES) {
     const a = await mountTarget()
@@ -163,7 +172,7 @@ test('P2 M4 extended A/B matrix: compaction/seeded/preset-preserved/plain satisf
       // ---- A
       const aRes = await importSessionViaA(a.persistence, cand)
       const aRead = await readAll(a.persistence, cand.header.id)
-      const nextTurn = Math.max(...cand.events.filter(x => x.type === 'turn/start').map(x => x.data.turn)) + 1
+      const nextTurn = Math.max(0, ...cand.events.filter(x => x.type === 'turn/start').map(x => x.data.turn)) + 1
       const aAppend = await verifyAppendCapability({
         persistence: a.persistence, id: cand.header.id,
         makeEvents: APPEND(cand.header.id, cand.events.length, nextTurn), expectedEvents: cand.events.length,
@@ -204,7 +213,7 @@ test('P2 M4 extended A/B matrix: compaction/seeded/preset-preserved/plain satisf
       // must fail this comparison), plus gates and duplicate-ID refusals.
       const aAfter = await readAll(a.persistence, cand.header.id)
       const bAfter = await readAll(b.persistence, cand.header.id)
-      const expectedAfter = [...cand.events, ...APPEND(cand.header.id, cand.events.length, Math.max(...cand.events.filter(x => x.type === 'turn/start').map(x => x.data.turn)) + 1)]
+      const expectedAfter = [...cand.events, ...APPEND(cand.header.id, cand.events.length, Math.max(0, ...cand.events.filter(x => x.type === 'turn/start').map(x => x.data.turn)) + 1)]
       const aPrefixOk = aAfter.events.slice(0, cand.events.length).every((ev, i) => JSON.stringify(ev) === JSON.stringify(cand.events[i]))
       const bPrefixOk = bAfter.events.slice(0, cand.events.length).every((ev, i) => JSON.stringify(ev) === JSON.stringify(cand.events[i]))
       assert.ok(aPrefixOk && bPrefixOk, `${kind}: the candidate prefix must survive the append on both paths`)

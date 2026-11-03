@@ -4,9 +4,9 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { Writable } from 'node:stream'
-import { mkdtempSync, writeFileSync, rmSync, readFileSync } from 'node:fs'
+import { mkdtempSync, writeFileSync, rmSync, readFileSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { createHash } from 'node:crypto'
 import { readV5Backup } from '../lib/archive/v5-reader.js'
 import { buildV5Archive, fileEntry } from './helpers/v5-fixture.mjs'
@@ -323,6 +323,18 @@ test('staging integration: sessions root extracted to private dir, other roots i
     }
     // Nothing from other roots landed on disk.
     for (const e of staged) assert.ok(!e.path.startsWith('storages') && !e.path.startsWith('settings'))
+    // M5 mode contract: 0600 files in 0700 directories where POSIX modes are
+    // enforced. Windows does not enforce POSIX bits (entries report 0666/
+    // 0777) — the platform limitation is recorded separately, never used as
+    // Android evidence.
+    if (process.platform !== 'win32') {
+      for (const e of staged) {
+        assert.equal(statSync(dirname(e.stagedTo)).mode & 0o777, 0o700, 'staging directory is 0700')
+        assert.equal(statSync(e.stagedTo).mode & 0o777, 0o600, 'staged file is 0600')
+      }
+    } else {
+      assert.ok(true, 'win32: POSIX mode bits are not enforced — recorded as a platform limitation')
+    }
   } finally {
     await staging.cleanupAll()
     rmSync(file, { force: true })
