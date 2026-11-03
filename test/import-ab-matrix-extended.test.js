@@ -151,9 +151,9 @@ const APPEND = (id, startSeq, turn) => [
   { type: 'turn/end', seq: startSeq + 2, time: 9_002, data: { turn, reason: { kind: 'completed' } } },
 ]
 
-const MATRIX_CASES = ['plain', 'compaction', 'seeded', 'preset-mapped']
+const MATRIX_CASES = ['plain', 'compaction', 'seeded', 'preset-preserved']
 
-test('P2 M4 extended A/B matrix: compaction/seeded/preset-mapped/plain satisfy the same gates on both paths', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
+test('P2 M4 extended A/B matrix: compaction/seeded/preset-preserved/plain satisfy the same gates on both paths', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
   const matrix = []
   for (const kind of MATRIX_CASES) {
     const a = await mountTarget()
@@ -189,7 +189,33 @@ test('P2 M4 extended A/B matrix: compaction/seeded/preset-mapped/plain satisfy t
       // preset mapping is preserved verbatim on both paths (mapping happens
       // at the plan layer, before the candidate is verified)
       assert.equal(aRead.header.agentPreset, bRead.header.agentPreset)
-      matrix.push({ case: kind, aEvents: cand.events.length, bEvents: cand.events.length, inherited: cand.inheritedEventCount, equivalent: true })
+      // R2.1: FULL semantic re-read AFTER the append — the append content
+      // must match exactly on both paths (a content swap with equal count
+      // must fail this comparison), plus gates and duplicate-ID refusals.
+      const aAfter = await readAll(a.persistence, cand.header.id)
+      const bAfter = await readAll(b.persistence, cand.header.id)
+      const expectedAfter = [...cand.events, ...APPEND(cand.header.id, cand.events.length, Math.max(...cand.events.filter(x => x.type === 'turn/start').map(x => x.data.turn)) + 1)]
+      const aPrefixOk = aAfter.events.slice(0, cand.events.length).every((ev, i) => JSON.stringify(ev) === JSON.stringify(cand.events[i]))
+      const bPrefixOk = bAfter.events.slice(0, cand.events.length).every((ev, i) => JSON.stringify(ev) === JSON.stringify(cand.events[i]))
+      assert.ok(aPrefixOk && bPrefixOk, `${kind}: the candidate prefix must survive the append on both paths`)
+      assert.equal(sha(aAfter.events), sha(bAfter.events), `${kind}: post-append events must match across paths`)
+      assert.equal(sha(aAfter.events), sha(expectedAfter), `${kind}: post-append events must equal candidate + APPEND exactly`)
+      await assert.rejects(() => importSessionViaA(a.persistence, cand), err => err.code === 'IMPORT_ID_CONFLICT', `${kind}: A duplicate id refuses`)
+      await assert.rejects(
+        () => publishSessionViaB({ persistence: b.persistence, sessionsRoot: b.sessionsRoot, candidate: cand, bytes }),
+        err => err.code === 'B_ID_CONFLICT', `${kind}: B duplicate id refuses`)
+      matrix.push({
+        case: kind,
+        aEvents: cand.events.length,
+        bEvents: cand.events.length,
+        inherited: cand.inheritedEventCount,
+        appended: aAppend,
+        postAppendMatch: sha(aAfter.events) === sha(bAfter.events) && sha(aAfter.events) === sha(expectedAfter),
+        aDuplicateRefused: true,
+        bDuplicateRefused: true,
+        // derived from the checks, never hardcoded
+        equivalent: aPrefixOk && bPrefixOk && sha(aAfter.events) === sha(bAfter.events) && sha(aAfter.events) === sha(expectedAfter),
+      })
     } finally {
       await a.unmount()
       await b.unmount()
@@ -221,17 +247,32 @@ test('P2 M4 parent/child group through A: parent binds the child fact; new insta
     const { childFactsFromArtifacts } = await import('../lib/migration/legacy-chain.js')
     const facts = await childFactsFromArtifacts([childArtifact])
 
-    // parent with catalog row
-    const parentHeader = codec.encodeHeader({ version: 3, id: 'ab-parent', createdAt: 1793500000000, cwd: a.base, isSeeded: false, delegationDepth: 0 }, 0)
-    const parentLogical = [
+    // R2.2 control: a parent whose OWN catalog row is self-sufficient stays
+    // 3→3 with the official chain even with childFacts=[] (separate positive).
+    const selfSufficientHeader = codec.encodeHeader({ version: 3, id: 'ab-parent-self', createdAt: 1793500000000, cwd: a.base, isSeeded: false, delegationDepth: 0 }, 0)
+    const selfSufficientLogical = [
       e2('turn/start', 0, { turn: 1 }),
       e2('subagent/catalog', 1, { childId: 'ab-child', mode: 'continuable', version: 1, provider: 'p', label: 'l', childCreatedAt: 1793500001000 }),
       e2('turn/end', 2, { turn: 1, reason: { kind: 'completed' } }),
     ]
+    const selfOut = await chain.migrateToV4(selfSufficientHeader, selfSufficientLogical.map(ev => codec.encodeEvent(ev)), { childFacts: [] })
+    assert.equal(selfOut.eventRows.length, 3, 'a self-sufficient parent catalog stays 3→3 (separate control)')
+
+    // R2.2 main case: a TRUE no-catalog 2-event parent — the child fact must
+    // ADD the catalog event (2→3) with the child identity in the output.
+    const parentHeader = codec.encodeHeader({ version: 3, id: 'ab-parent', createdAt: 1793500000000, cwd: a.base, isSeeded: false, delegationDepth: 0 }, 0)
+    const parentLogical = [
+      e2('turn/start', 0, { turn: 1 }),
+      e2('turn/end', 1, { turn: 1, reason: { kind: 'completed' } }),
+    ]
     const parentOut = await chain.migrateToV4(parentHeader, parentLogical.map(ev => codec.encodeEvent(ev)), { childFacts: facts })
+    assert.equal(parentOut.eventRows.length, 3, `the bound child fact must ADD the catalog event (2→3), got ${parentOut.eventRows.length}`)
     const parentRestore = cat.createRestore(parentOut.headerRow, { recovery: 'strict', validation: 'current' })
     for (const row of parentOut.eventRows) parentRestore.decodeRow(row)
     const parentArtifact = parentRestore.finish()
+    const catalogEvent = parentArtifact.events.find(x => x.type === 'subagent/catalog')
+    assert.ok(catalogEvent, 'the output must contain the added subagent/catalog')
+    assert.equal(catalogEvent.data?.childId, 'ab-child', 'the catalog must name the child identity')
 
     // A-path import: child first, then parent with the bound fact
     const { importSessionViaA } = await import('../lib/import/writer-a.js')
@@ -240,22 +281,23 @@ test('P2 M4 parent/child group through A: parent binds the child fact; new insta
     assert.equal(parentResult.steps.readback.ok, true)
     // the parent readback contains the bound subagent/catalog event
     const parentRead = await readAll(a.persistence, 'ab-parent')
-    assert.ok(parentRead.events.some(x => x.type === 'subagent/catalog'), 'bound fact completes the parent catalog')
-    // new-instance visibility
-    const fresh = await mountTarget()
-    // mount a second instance on the SAME root
+    assert.ok(parentRead.events.some(x => x.type === 'subagent/catalog' && x.data?.childId === 'ab-child'), 'bound fact completes the parent catalog with the child identity')
+    // new-instance visibility (R2.3: this instance IS used and disposed)
     const req2 = createRequire(join(rc4Dir, 'noop.js'))
     const jsonl2 = await import(pathToFileURL(req2.resolve('@deepseek-ai/dsh-session-persistence-jsonl')).href)
     const { Context } = await import(pathToFileURL(req2.resolve('@deepseek-ai/cordis')).href)
     const ctx2 = new Context()
-    // reuse the same sessions root by pointing at a.base/sessions
     const sessionsRoot = join(a.base, 'sessions')
     await ctx2.plugin(jsonl2, { root: sessionsRoot, compression: 'zstd' })
     try {
-      const childVisible = await ctx2.sessionPersistence.stat('ab-child')
-      const parentVisible = await ctx2.sessionPersistence.stat('ab-parent')
-      assert.ok(childVisible, 'child visible on a new instance')
-      assert.ok(parentVisible, 'parent visible on a new instance')
+      // R2.2: new-instance SEMANTIC readback, not just stat — the parent's
+      // catalog event with the child identity must be visible there too.
+      const pRead = await ctx2.sessionPersistence.open('ab-parent', 'read')
+      let pEvents
+      try { pEvents = (await pRead.read()).events } finally { await pRead.close() }
+      assert.ok(pEvents.some(x => x.type === 'subagent/catalog' && x.data?.childId === 'ab-child'), 'new instance reads the completed catalog semantics')
+      assert.ok(await ctx2.sessionPersistence.stat('ab-child'), 'child visible on a new instance')
+      assert.ok(await ctx2.sessionPersistence.stat('ab-parent'), 'parent visible on a new instance')
     } finally {
       await ctx2.fiber?.dispose?.()
     }

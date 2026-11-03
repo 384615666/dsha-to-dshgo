@@ -1,20 +1,20 @@
 // P2 M5: F8 — runtime-unique fake credentials injected into excluded
-// credential/config roots and into an error path; every observable output is
-// scanned for leakage. The marker is generated at RUNTIME (never a hardcoded
-// token in shipped source), so a leak cannot be masked by tests that strip a
-// known constant.
+// credential/config roots and into a real job error path; every observable
+// output channel is scanned for leakage, with NEGATIVE CONTROLS proving the
+// scanner detects deliberate leaks. The marker is generated at RUNTIME (never
+// hardcoded into shipped source), so a leak cannot be masked by tests that
+// strip a known constant.
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync, existsSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, rmSync, readFileSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { randomBytes } from 'node:crypto'
 import fs from 'node:fs'
 import { spawnSync } from 'node:child_process'
-import { createRequire } from 'node:module'
-import { pathToFileURL } from 'node:url'
 import { captureTargetPreState } from '../lib/import/g6.js'
 import { sanitizeRoots } from '../lib/inspect-sessions.js'
+import { ImportJournal } from '../lib/import/journal.js'
 
 const rc4Dir = process.env.RC4_MODULES
 const skip = !rc4Dir
@@ -23,78 +23,62 @@ function runtimeMarker() {
   return `F8TOKEN-${randomBytes(16).toString('hex')}`
 }
 
-// Collect every observable output channel of one job run.
-function collectOutputs({ stdout, stderr, report, jobDir }) {
-  const blobs = []
-  if (stdout) blobs.push(stdout)
-  if (stderr) blobs.push(stderr)
-  if (report) blobs.push(JSON.stringify(report))
-  // every file the job created (journal, snapshot, quarantine payloads)
-  if (jobDir && existsSync(jobDir)) {
-    const walk = d => {
-      for (const name of fs.readdirSync(d)) {
-        const p = join(d, name)
-        if (fs.statSync(p).isDirectory()) walk(p)
-        else blobs.push(readFileSync(p).toString('utf8'))
-      }
-    }
-    walk(jobDir)
+// The leak scanner under test: returns the channels containing the marker.
+function scanForMarker(channels, marker) {
+  const hits = []
+  for (const [channel, content] of Object.entries(channels)) {
+    if (typeof content === 'string' && content.includes(marker)) hits.push(channel)
   }
-  return blobs
+  return hits
 }
 
-test('P2 F8: runtime fake credentials in excluded roots/metadata never reach any output', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
+test('P2 F8 scanner negative control: a deliberate leak into stdout/report IS detected', () => {
+  const token = runtimeMarker()
+  // negative controls: the scanner must catch deliberate leaks
+  assert.deepEqual(scanForMarker({ stdout: `ok ${token}`, report: '{"clean":true}' }, token), ['stdout'])
+  assert.deepEqual(scanForMarker({ stdout: 'clean', report: `{"note":"${token}"}` }, token), ['report'])
+  // positive control: clean channels pass
+  assert.deepEqual(scanForMarker({ stdout: 'clean', report: '{"clean":true}' }, token), [])
+})
+
+test('P2 F8: runtime fake credentials in excluded roots never reach report channels', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
   const token = runtimeMarker()
   const dir = mkdtempSync(join(tmpdir(), 'f8-'))
   try {
-    // synthetic archive-like structures: excluded credential/config roots
-    // carrying the fake tokens
-    const storageRoot = join(dir, 'storage')
-    mkdirSync(storageRoot, { recursive: true })
-    // sanitizeRoots is the report gate: credential/bridge/token roots must be excluded
-    const report = {
-      archive: {
-        manifest: {
-          roots: sanitizeRoots([
-            { id: 'r1', scope: 'settings', name: `.credentials.yaml` },
-            { id: 'r2', scope: 'settings', name: '.bridge_token' },
-            { id: 'r3', scope: 'settings', name: 'sessions' },
-          ]),
-        },
-      },
-    }
-    const blob = JSON.stringify(report)
-    assert.ok(!blob.includes(token), 'sanitized report must not contain excluded root names')
-    assert.ok(blob.includes('sessions'), 'non-sensitive roots stay listed')
-    assert.equal(report.archive.manifest.roots.excludedSensitive, 2, 'excluded count is kept as a number, not a name')
+    // The token is placed INSIDE the excluded roots' payloads (content of
+    // .credentials.yaml / .bridge_token) — the F8 injection contract.
+    const roots = [
+      { id: 'r1', scope: 'settings', name: '.credentials.yaml', payload: `api_key: ${token}` },
+      { id: 'r2', scope: 'settings', name: '.bridge_token', payload: `token: ${token}` },
+      { id: 'r3', scope: 'settings', name: 'sessions', payload: null },
+    ]
+    // precondition: the injected input really carries the marker
+    assert.ok(roots.map(r => r.payload ?? '').join('\n').includes(token), 'precondition: the injected input contains the marker')
 
-    // the FULL captured snapshot (with unit copy bytes) scanned for markers:
-    // the unit itself contains workspace metadata only; inject tokens into
-    // unit bytes to prove the snapshot copy is scanned as an output channel.
+    const report = { archive: { manifest: { roots: sanitizeRoots(roots) } } }
+    const hits = scanForMarker({
+      stdout: JSON.stringify(report),
+      stderr: '',
+      report: JSON.stringify({ archive: report.archive, warnings: [] }),
+    }, token)
+    assert.deepEqual(hits, [], `report/stdout channels must be clean (leaked in: ${hits})`)
+    assert.ok(JSON.stringify(report).includes('sessions'), 'non-sensitive roots stay listed')
+    assert.equal(report.archive.manifest.roots.excludedSensitive, 2, 'excluded count kept as a number, not a name')
+
+    // the workspace unit copy is an INTERNAL restore artifact (it carries the
+    // target's own storage content and must survive for restoration) — its
+    // classification is explicit and it is NOT a public report channel.
     const jobDir = join(dir, 'job')
-    const snapshotDir = jobDir
-    const unitBytes = Buffer.from(JSON.stringify({ note: token }))
-    // capture with a provider that would embed the token — the snapshot file
-    // is a legitimate output channel, so its content is scanned.
-    const { captureTargetPreState } = await import('../lib/import/g6.js')
     const fakePersistence = { stat: async () => undefined }
+    const unitBytes = Buffer.from(JSON.stringify({ note: token, workspaceIds: [], archivedSessionIds: [], pinnedSessionIds: [], workspaces: {} }))
     const snapshot = await captureTargetPreState({
       persistence: fakePersistence,
       plannedSessionIds: ['f8-s'],
       workspaceUnitProvider: async () => ({ bytes: unitBytes, projection: { workspaceIds: [], archivedSessionIds: [], pinnedSessionIds: [], workspaces: {} } }),
-      snapshotDir,
+      snapshotDir: jobDir,
     })
-    const outputs = collectOutputs({ report: snapshot, jobDir })
-    // NOTE: the workspace unit is a REQUIRED restore artifact of the target
-    // itself — if the unit legitimately contains the token (i.e. the target's
-    // own storage had it), the snapshot must keep it for restoration. F8
-    // asserts the REPORT channels (stdout/stderr/report JSON) are clean, not
-    // the internal restore payload. So: scan report JSON but exclude the
-    // internal unit copy from the leak scan, and assert that decision is
-    // explicit here.
-    const reportBlob = JSON.stringify({ archive: report.archive, sessions: snapshot.sessions, ownership: snapshot.ownership })
-    assert.ok(!reportBlob.includes(token), 'report channels must not echo the credential token')
-    void outputs
+    const unitFile = join(jobDir, snapshot.workspaceUnit.file)
+    assert.ok(readFileSync(unitFile).includes(token), 'the internal restore payload keeps the target content (by design)')
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
@@ -116,42 +100,94 @@ test('P2 F8: error-path diagnostic messages do not echo injected credentials', {
       captured = error
     }
     assert.ok(captured, 'the damaged row refuses')
-    assert.ok(!String(captured.message).includes(token), 'error text must not echo the token')
-    // the full error object (name/message/code/stack) scanned too
     const full = `${captured.name}\n${captured.message}\n${captured.stack ?? ''}`
-    assert.ok(!full.includes(token), 'stack must not echo the token either')
+    assert.ok(!full.includes(token), 'error text/stack must not echo the token')
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
 })
 
-test('P2 F8: shipped package sources contain no runtime markers (spawned scan)', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
+// R1.2: the REAL production job entry must not echo a token-carrying storage
+// failure into its public report — with the token PROVEN present in the
+// injected input first.
+test('P2 F8: a real runImportJob with a token-carrying storage failure leaks nothing into stdout/stderr/report', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
+  const token = runtimeMarker()
+  const dir = mkdtempSync(join(tmpdir(), 'f8-job-'))
+  try {
+    const { runImportJob } = await import('../lib/import/job.js')
+    const { ImportJournal } = await import('../lib/import/journal.js')
+    const failingPersistence = {
+      stat: async () => { const e = new Error(`storage backend echoed ${token}`); e.code = 'SYNTHETIC_STORAGE_FAILED'; throw e },
+      open: async () => { throw new Error('unreachable') },
+      list: async () => [],
+    }
+    const jobDir = join(dir, 'job')
+    mkdirSync(jobDir, { recursive: true })
+    const approvedPlan = {
+      digest: '0'.repeat(64),
+      sourceDigest: 'src-f8',
+      target: { instanceFingerprint: 'inst-f8' },
+      selected: ['f8-s'],
+      excluded: [],
+      sessions: [],
+    }
+    const journal = ImportJournal.init(join(jobDir, 'journal.json'), { instanceFingerprint: 'inst-f8', sourceDigest: 'src-f8' }, { requirePlanApproval: true })
+    journal.approvePlan({ digest: approvedPlan.digest })
+    journal.transitionBatch('PLANNED')
+    // precondition: the token really is in the injected error input
+    const probeError = await failingPersistence.stat().then(() => null, e => e)
+    assert.ok(String(probeError.message).includes(token), 'precondition: the injected storage error carries the marker')
+
+    let stdout = ''
+    let stderr = ''
+    const origOut = process.stdout.write.bind(process.stdout)
+    const origErr = process.stderr.write.bind(process.stderr)
+    process.stdout.write = chunk => { stdout += String(chunk); return true }
+    process.stderr.write = chunk => { stderr += String(chunk); return true }
+    let report
+    try {
+      report = await runImportJob({
+        jobDir,
+        instanceLockDir: join(dir, 'lock'),
+        instanceFingerprint: 'inst-f8',
+        sourceDigest: 'src-f8',
+        approvedPlan,
+        target: { persistence: failingPersistence, workspaceRegistry: undefined, workspaceUnitProvider: undefined },
+        sessions: [{ id: 'f8-s', header: { version: 4, id: 'f8-s' }, events: [], inheritedEventCount: 0 }],
+        withdrawSession: async () => {},
+        allowUnprotected: true,
+      })
+    } finally {
+      process.stdout.write = origOut
+      process.stderr.write = origErr
+    }
+    assert.equal(report.status, 'FAILED')
+    // THE core F8 assertion: no public channel contains the token
+    const hits = scanForMarker({ stdout, stderr, report: JSON.stringify(report) }, token)
+    assert.deepEqual(hits, [], `public channels leaked the token: ${hits}`)
+    assert.ok(!String(report.error?.message ?? '').includes(token), 'the public error message must not echo the token')
+    assert.equal(report.error.code, 'SYNTHETIC_STORAGE_FAILED', 'the stable code survives for diagnostics')
+    assert.equal(report.error.publicTextWithheld, true)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('P2 F8: shipped sources contain no runtime markers; the scanner detects deliberate stdout leaks', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
   const token = runtimeMarker()
   const dir = mkdtempSync(join(tmpdir(), 'f8-pkg-'))
   try {
-    // spawn a child that imports the shipped library, runs a tiny job with
-    // the injected token in an excluded root, and prints everything it can.
-    const libUrl = pathToFileURL(join(import.meta.dirname, '..', 'lib', 'inspect-sessions.js')).href
-    const script = `
-      const { sanitizeRoots } = await import(${JSON.stringify(libUrl)});
-      const token = ${JSON.stringify(token)};
-      // simulate the widest possible accidental echo attempt
-      const report = { roots: sanitizeRoots([
-        { id: 'r1', scope: 'settings', name: '.credentials.yaml' },
-        { id: 'r2', scope: 'settings', name: 'sessions' },
-      ]) };
-      process.stdout.write(JSON.stringify({ report, tokenAttempt: token }));
-    `
-    const res = spawnSync(process.execPath, ['--input-type=module', '-e', script], { encoding: 'utf8', timeout: 60_000 })
-    assert.equal(res.status, 0, String(res.stderr).slice(0, 300))
-    // the child INTENTIONALLY echoes the token via tokenAttempt (simulating a
-    // leak vector) — the shipped sanitize layer must not have amplified it
-    // into report channels. The packaging scan then asserts the SHIPPED
-    // SOURCES never contain a runtime-generated token (impossible by
-    // construction, verified by scanning the lib tree).
-    const parsed = JSON.parse(res.stdout)
-    assert.ok(parsed.report.roots.excludedSensitive >= 1)
-    // scan the shipped lib sources for the runtime token: none can contain it
+    // NEGATIVE CONTROL: a child that deliberately leaks the token to stdout
+    // must be DETECTED by the scanner (the previous test printed it and
+    // passed anyway — that gap is what this control closes).
+    const leakScript = `process.stdout.write(${JSON.stringify(`leak ${token}`)});`
+    const leaked = spawnSync(process.execPath, ['--input-type=module', '-e', leakScript], { encoding: 'utf8', timeout: 60_000 })
+    assert.equal(leaked.status, 0)
+    assert.deepEqual(scanForMarker({ stdout: leaked.stdout, stderr: leaked.stderr }, token), ['stdout'], 'the scanner MUST detect a deliberate stdout leak')
+    // positive control: clean child output passes
+    const clean = spawnSync(process.execPath, ['--input-type=module', '-e', 'process.stdout.write(JSON.stringify({clean:true}));'], { encoding: 'utf8', timeout: 60_000 })
+    assert.deepEqual(scanForMarker({ stdout: clean.stdout, stderr: clean.stderr }, token), [])
+    // static supplement: shipped lib sources cannot contain a RUNTIME token
     const libDir = join(import.meta.dirname, '..', 'lib')
     const walk = d => {
       let hits = 0

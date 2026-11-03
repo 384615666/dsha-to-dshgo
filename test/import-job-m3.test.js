@@ -366,7 +366,7 @@ test('P2 R1 regression: metadata id != header.id refuses BEFORE any write; DONE 
       withdrawSession: async () => { throw new Error('no writes must happen') },
       allowUnprotected: true,
     })
-    assert.match(String(result.error?.message), /identity mismatch/)
+    assert.equal(result.error?.code, 'IMPORT_PLAN_BINDING', 'identity mismatch must carry the stable binding code')
     assert.equal(await t.persistence.stat('unapproved-header-id'), before, 'nothing was written for the mismatched candidate')
 
     // DONE rerun with a REMOVED session: the persisted plan set re-checks
@@ -577,7 +577,7 @@ test('P2 F1/F2/F3: late-present corrupt file refuses with no dangling intent; us
       withdrawSession: async () => {},
       allowUnprotected: true,
     })
-    assert.match(String(run2.error?.message), /identity mismatch/, `mismatched candidate must refuse: ${JSON.stringify(run2.error)}`)
+    assert.equal(run2.error?.code, 'IMPORT_PLAN_BINDING', `mismatched candidate must refuse with the binding code: ${JSON.stringify(run2.error)}`)
     assert.equal(await t3.persistence.stat('done-approved-a'), undefined, 'A stays missing — never impersonated')
     assert.equal(await t3.persistence.stat('done-unrelated-b'), undefined, 'B was never imported')
   } finally {
