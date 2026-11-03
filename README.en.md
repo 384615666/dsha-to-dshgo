@@ -3,7 +3,7 @@
 A DSH bundle plugin that migrates sessions from a **DSHA one-click backup** into **dsh-Go**. Migrated sessions live in a dedicated workspace with their message/tool history, preset and timeline; they can be continued after import.
 
 - No APK modification, no root, no private ADB pulls, and no desktop-only final product.
-- Large backups are streamed from the phone's `Download/DSHA` directory after the official “访问手机文件” grant; the system picker remains the ≤8 MiB path.
+- Large backups are streamed from the phone's `Download/DSHA` directory after the official “访问手机文件” grant; the system file picker also selects one backup file.
 - Only the backup the user selects is read; parsing, staging and writing happen **on the device**, with no upload of chat data.
 - Sensitive files inside the backup (`.credentials.yaml` etc.) are integrity-checked only: never migrated, reported or printed.
 
@@ -11,13 +11,13 @@ A DSH bundle plugin that migrates sessions from a **DSHA one-click backup** into
 
 Implemented and verified against an isolated rc.4 engine with a real backup:
 
-- **Input**: DSHA v5 backup (gzip magic, accepts `..gz`); system picker ≤8 MiB; product `Download/DSHA` scan + streaming staging for large files.
+- **Input**: DSHA v5 backup (gzip magic, accepts `..gz`); scan the phone's `Download/DSHA` (streaming, large files supported), or choose one backup through the system file picker.
 - **Parsing/restore**: full archive verification, allowlisted staging, official historical chain (v0–v3 → v4), parent/child catalog binding, official `locate()` location verification; unavailable/ambiguous/non-canonical generations are isolated and reported instead of silently falling back.
 - **A-path write**: official `create/append/flush/close` plus full semantic readback; source session IDs preserved.
 - **Attachments**: published before sessions (images byte-for-byte, files verbatim), official readback before create; created objects are quarantined (never deleted) on rollback, shared objects stay.
 - **Safety**: G6 workspace-unit snapshot, approved-plan content gate, durable journal, protected withdrawal rollback, user edits/additions/new references preserved as pending; stale crash locks/guards are inspectable and explicitly releasable from the recovery panel.
 - **Privacy**: task-private data under `$DSH_HOME/dsha-migrator/`, files 0600/directories 0700; explicit task-data deletion; diagnostics stay in the private data directory.
-- **Native panel**: pick backup (picker or Download/DSHA) → verify progress → paginated session selection → preset/cwd mapping → approve plan → start/cancel → result and recovery.
+- **Native panel**: browse `Download/DSHA` → verify progress → paginated session selection → preset/cwd mapping → approve plan → start/cancel → result and recovery.
 
 Baseline: 208 automated tests with the isolated engine and real fixtures; SDK manifest/half-host load/zh-en panels pass; the npm package gate passes. Historical generations (v0–v3) have synthetic fixtures only — **not validated against real user legacy data**.
 

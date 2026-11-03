@@ -17,12 +17,12 @@
 
 已实现并通过桌面隔离引擎与真实备份验证：
 
-- **输入**：DSHA v5 一键备份（gzip magic 识别，接受 `..gz` 等扩展名）；系统 files 选择器（≤8 MiB）；产品级「Download/DSHA」扫描 + 流式暂存（>8 MiB 不再整文件进内存）。
+- **输入**：DSHA v5 一键备份（gzip magic 识别，接受 `..gz` 等扩展名）；可从 `Download/DSHA` 扫描并流式暂存（支持大文件），也可从系统文件选择器选择单个备份文件。
 - **解析/恢复**：整包校验、白名单暂存、官方历史迁移链（v0–v3 → v4）、父子 catalog 绑定、官方 locate 位置校验；最高代不可用/ambiguous/非 canonical 名一律隔离并进入报告，不静默回退旧代。
 - **写入（A 路径）**：官方 `sessionPersistence.create/append/flush/close` + 全量语义读回；保留源会话 ID。
 - **附件**：附件先行发布（图片逐字节、文件 verbatim），官方读回后才创建会话；失败/取消时本批新建对象移入 quarantine（不删除），共享对象保留。
 - **安全**：G6 工作区完整单元快照、批准计划内容门禁、journal 持久化、受保护撤回回滚、用户改名/追加/新增引用保留并 pending；进程崩溃遗留的实例锁/guard 会显示在恢复面板，经用户确认后可解除并继续回滚。
-- **原生面板**：选择备份 → 校验进度 → 分页选择会话 → preset/cwd 映射 → 确认计划 → 开始/取消 → 结果与恢复。P0 探针收在「开发工具」里。
+- **原生面板**：选择备份/从 `Download/DSHA` 选择 → 校验进度 → 分页选择会话 → preset/cwd 映射 → 确认计划 → 开始/取消 → 结果与恢复。P0 探针收在「开发工具」里。
 - **重复导入**：相同备份重跑会重新核验目标；一致显示「已完成」，目标被修改则要求恢复判断，不会静默追加。
 
 验证基线：`208` 项自动化测试（隔离 rc.4 引擎与真实备份夹具；三组环境分别运行）；SDK 清单/半宿主加载/中英文面板通过；npm 包门禁通过。旧代（v0–v3）只有合成夹具证据，**未在真实用户旧数据上验证**。
@@ -83,7 +83,7 @@ A DSH bundle plugin that migrates sessions from a **DSHA** one-click backup into
 
 Implemented and verified against an isolated rc.4 engine with a real backup:
 
-- **Input**: DSHA v5 backup (gzip magic, accepts `..gz`); system files picker (≤8 MiB); product `Download/DSHA` scan + streaming staging for large files.
+- **Input**: DSHA v5 backup (gzip magic, accepts `..gz`); scan the phone's `Download/DSHA` and stream it into the private job, so large backups are supported without loading the whole file.
 - **Parsing/restore**: full archive verification, allowlisted staging, official historical chain (v0–v3 → v4), parent/child catalog binding, official `locate()` location verification; unavailable/ambiguous/non-canonical generations are isolated and reported instead of silently falling back.
 - **A-path write**: official `create/append/flush/close` plus full semantic readback; source session IDs preserved.
 - **Attachments**: published before sessions (images byte-for-byte, files verbatim), official readback before create; created objects are quarantined (never deleted) on rollback, shared objects stay.

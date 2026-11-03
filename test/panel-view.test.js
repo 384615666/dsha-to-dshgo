@@ -7,6 +7,8 @@ test('product panel idle view exposes the large-backup entry and stays within th
   const text = JSON.stringify(view)
   assert.match(text, /scanLarge/)
   assert.match(text, /Download\/DSHA/)
+  assert.match(text, /选择备份/)
+  assert.ok(!text.includes('8 MiB') && !text.includes('≤8'), 'the old picker-size copy must not be shown')
   assert.ok(Buffer.byteLength(text, 'utf8') <= 32 * 1024, `panel view is ${Buffer.byteLength(text, 'utf8')} bytes`)
 })
 
