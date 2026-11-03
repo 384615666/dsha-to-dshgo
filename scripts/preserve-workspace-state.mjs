@@ -61,7 +61,9 @@ try {
 }
 
 // 3. session header cwds only (no bodies): the offline diff needs an exact
-//    owner per duplicated session id.
+//    owner per duplicated session id. Only the highest canonical generation
+//    is evidence; conflicting cwds at that generation are recorded, never
+//    resolved by directory traversal order.
 function headerFromFile(path) {
   const bytes = fs.readFileSync(path)
   let text
@@ -73,17 +75,36 @@ function headerFromFile(path) {
     text = bytes.toString('utf8')
   }
   const line = text.split('\n')[0]
-  return JSON.parse(line)
+  return { header: JSON.parse(line), headerSha256: sha256(Buffer.from(line)) }
+}
+
+function generationOf(name, header) {
+  if (Number.isInteger(header?.version)) return header.version
+  const match = /^session\.v(\d+)\.jsonl/.exec(name)
+  return match ? Number(match[1]) : 0
 }
 
 const sessionsRoot = join(home, 'sessions')
+const sessionsById = new Map()
 try {
   for (const rel of fs.readdirSync(sessionsRoot, { recursive: true })) {
     const name = rel.split(/[\\/]/).pop()
     if (!/^session(?:\.v\d+)?\.jsonl(?:\.zstd)?$/.test(name)) continue
     try {
-      const header = headerFromFile(join(sessionsRoot, rel))
-      manifest.sessionHeaders.push({ id: header.id, cwd: header.cwd ?? null, version: header.version })
+      const { header, headerSha256 } = headerFromFile(join(sessionsRoot, rel))
+      const record = {
+        id: header.id,
+        cwd: header.cwd ?? null,
+        version: header.version ?? null,
+        generation: generationOf(name, header),
+        file: rel,
+        headerSha256,
+      }
+      manifest.sessionHeaders.push(record)
+      if (typeof record.id !== 'string') continue
+      const list = sessionsById.get(record.id) ?? []
+      list.push(record)
+      sessionsById.set(record.id, list)
     } catch (error) {
       manifest.errors.push({ name: `session:${rel}`, error: `${error?.code ?? error?.name}: ${error?.message}` })
     }
@@ -92,11 +113,26 @@ try {
   manifest.errors.push({ name: 'sessions', error: `${error?.code ?? error?.name}: ${error?.message}` })
 }
 
-// A simple id → cwd map for scripts/workspace-repair-diff.mjs.
+// A simple id → cwd map for scripts/workspace-repair-diff.mjs. An id with
+// two different cwds at its highest generation is left out and reported.
 const sessionCwds = {}
-for (const header of manifest.sessionHeaders) {
-  if (typeof header.id === 'string' && typeof header.cwd === 'string') sessionCwds[header.id] = header.cwd
+manifest.sessionConflicts = []
+for (const [id, list] of sessionsById) {
+  const max = Math.max(...list.map(r => r.generation))
+  const top = list.filter(r => r.generation === max)
+  const dirs = [...new Set(top.map(r => r.cwd).filter(c => typeof c === 'string'))]
+  if (dirs.length === 1) {
+    sessionCwds[id] = dirs[0]
+  } else {
+    manifest.sessionConflicts.push({
+      id,
+      generation: max,
+      reason: dirs.length === 0 ? 'no-cwd' : 'different-cwds',
+      candidates: dirs,
+      files: top.map(r => r.file),
+    })
+  }
 }
 fs.writeFileSync(join(out, 'session-cwds.json'), JSON.stringify(sessionCwds, null, 2), { mode: 0o600 })
 fs.writeFileSync(join(out, 'preserve-manifest.json'), JSON.stringify(manifest, null, 2), { mode: 0o600 })
-console.log(JSON.stringify({ out, files: manifest.files.length, sessionHeaders: manifest.sessionHeaders.length, errors: manifest.errors.length }, null, 2))
+console.log(JSON.stringify({ out, files: manifest.files.length, sessionHeaders: manifest.sessionHeaders.length, sessionConflicts: manifest.sessionConflicts.length, errors: manifest.errors.length }, null, 2))

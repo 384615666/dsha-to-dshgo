@@ -25,9 +25,9 @@
 - **原生面板**：选择备份 → 校验进度 → 分页选择会话 → preset/cwd 映射 → 确认计划 → 开始/取消 → 结果与恢复。P0 探针收在「开发工具」里。
 - **重复导入**：相同备份重跑会重新核验目标；一致显示「已完成」，目标被修改则要求恢复判断，不会静默追加。
 
-验证基线：`178` 项自动化测试（隔离 rc.4 引擎与真实备份夹具；三组环境分别运行）；SDK 清单/半宿主加载/中英文面板通过；npm 包门禁通过。旧代（v0–v3）只有合成夹具证据，**未在真实用户旧数据上验证**。
+验证基线：`179` 项自动化测试（隔离 rc.4 引擎与真实备份夹具；三组环境分别运行）；SDK 清单/半宿主加载/中英文面板通过；npm 包门禁通过。旧代（v0–v3）只有合成夹具证据，**未在真实用户旧数据上验证**。
 
-**尚未完成/未放行**：真机上的原生列表标题、重启后读取、真实续聊与真实模型验收；B 路径仍是实验入口，未接入统一作业；npm 发布与市场真实安装未执行。当前版本不要作为唯一数据副本使用。
+**尚未完成/未放行**：续聊测试 turn 已持久化，但凭据检查因缺少 DeepSeek API Key 报错，完整真实续聊仍待验证；B 路径仍是实验入口，未接入统一作业；npm 发布与市场真实安装未执行。真机原生列表、工作区筛选、标题、重启和重开历史已在 Redmi 上通过。当前版本不要作为唯一数据副本使用。
 
 ### 开发期安装（dsh-Go，无需 Root）
 
@@ -90,9 +90,9 @@ Implemented and verified against an isolated rc.4 engine with a real backup:
 - **Native panel**: pick backup → verify progress → paginated session selection → preset/cwd mapping → approve plan → start/cancel → result and recovery. P0 probes remain under Dev tools.
 - **Repeat import**: the same backup re-verifies the target; identical content reports done, a changed target requires recovery instead of silent appends.
 
-Baseline: `178` automated tests across three environments; SDK manifest/half-host load/zh-en panels pass; the npm package gate passes. Historical generations (v0–v3) have synthetic fixtures only — **not validated against real user legacy data**.
+Baseline: `179` automated tests across three environments; SDK manifest/half-host load/zh-en panels pass; the npm package gate passes. Historical generations (v0–v3) have synthetic fixtures only — **not validated against real user legacy data**.
 
-**Not released yet**: native list titles, restart, real chat continuation and real-model acceptance on a physical device; B path remains an experimental entry and is not wired into the job; npm publishing and market installation are not done. Do not use this version as the only copy of your data.
+**Not released yet**: the continuation test turn persisted, but the credential check failed because no DeepSeek API key is configured, so full real continuation remains unverified; B path remains an experimental entry and is not wired into the job; npm publishing and market installation are not done. Native list, workspace filter, titles, restart and history reopening pass on the Redmi. Do not use this version as the only copy of your data.
 
 ### Development install (no root)
 

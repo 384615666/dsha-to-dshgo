@@ -162,6 +162,39 @@ test('P2 M2 publish: normalized images are copied byte-for-byte (no re-encode); 
   }
 })
 
+test('P2 M2 publish: an empty file is a real object read back as zero bytes; a missing source refuses', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
+  const t = await mountStore()
+  try {
+    const empty = Buffer.alloc(0)
+    const emptyRef = { attachmentId: `sha256:${sha(empty)}`, name: 'empty.txt', bytes: 0 }
+    const emptyObject = { key: `file:${sha(empty)}:empty.txt`, kind: 'file', digest: sha(empty), ref: emptyRef, usedBy: ['s1'] }
+    const planned = await planAttachmentPublication({
+      objects: [emptyObject],
+      exists: async () => false,
+      readSource: async () => empty,
+    })
+    const result = await publishAttachments({ store: t.store, attachmentRoot: t.root, planned })
+    assert.equal(result.published.length, 1)
+    const chunks = []
+    for await (const chunk of t.store.readFileStream(emptyRef)) chunks.push(Buffer.from(chunk))
+    assert.equal(Buffer.concat(chunks).length, 0, 'official reader returns the zero-byte object')
+    assert.equal(sha(Buffer.concat(chunks)), sha(empty))
+
+    const missing = { ...emptyRef, attachmentId: `sha256:${'f'.repeat(64)}`, name: 'missing.txt', bytes: 1 }
+    const missingObject = { ...emptyObject, key: 'file:missing', digest: 'f'.repeat(64), ref: missing }
+    await assert.rejects(
+      () => planAttachmentPublication({
+        objects: [missingObject],
+        exists: async () => false,
+        readSource: async () => { const e = new Error('missing source'); e.code = 'ENOENT'; throw e },
+      }),
+      err => err.code === 'ENOENT' || /missing source/.test(String(err?.message)),
+    )
+  } finally {
+    await t.unmount()
+  }
+})
+
 test('P2 M2 publish: source digest/length mismatches and an fsync failure refuse; cancellation leaves the intent unconfirmed', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
   const t = await mountStore()
   try {
