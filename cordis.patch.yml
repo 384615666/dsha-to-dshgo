@@ -1,4 +1,4 @@
 # dsh plugin --profile web add /path/to/dsh-dsha-migrator
 - insert:
     - id: dsh-dsha-migrator
-      name: "@dsha-migration/dsh-dsha-migrator"
+      name: "dsha-to-dshgo"
