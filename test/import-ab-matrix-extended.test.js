@@ -92,7 +92,7 @@ async function buildCandidate(kind, id, cwd) {
       e('step/end', 4, { turn: 1, step: 1 }),
       e('turn/end', 5, { turn: 1, reason: { kind: 'completed' } }),
     ]
-  } else if (kind === 'preset-mapped') {
+  } else if (kind === 'preset-preserved') {
     preset = 'custom-source-preset'
     logical = [
       e('turn/start', 0, { turn: 1 }),
@@ -186,9 +186,19 @@ test('P2 M4 extended A/B matrix: compaction/seeded/preset-preserved/plain satisf
       assert.equal(aRead.inherited, cand.inheritedEventCount, `${kind}: A inherited cut`)
       assert.equal(bRead.inherited, cand.inheritedEventCount, `${kind}: B inherited cut`)
       assert.equal(aAppend, bAppend, `${kind}: identical append counts`)
+      // per-row gate assertions: B's list/open/writeOpen steps must pass
+      assert.equal(bRes.steps.list.ok, true, `${kind}: B list gate`)
+      assert.equal(bRes.steps.writeOpen.ok, true, `${kind}: B writeOpen gate`)
+      assert.equal(bRes.steps.readback.ok, true, `${kind}: B readback gate`)
+      assert.equal(aRes.steps.readback.ok, true, `${kind}: A readback gate`)
       // preset mapping is preserved verbatim on both paths (mapping happens
-      // at the plan layer, before the candidate is verified)
+      // at the plan layer, before the candidate is verified). For the
+      // preset-preserved case this proves the CUSTOM preset really flowed
+      // through (not silently standard).
       assert.equal(aRead.header.agentPreset, bRead.header.agentPreset)
+      if (kind === 'preset-preserved') {
+        assert.equal(aRead.header.agentPreset, 'custom-source-preset', 'the custom preset must be exercised verbatim')
+      }
       // R2.1: FULL semantic re-read AFTER the append — the append content
       // must match exactly on both paths (a content swap with equal count
       // must fail this comparison), plus gates and duplicate-ID refusals.

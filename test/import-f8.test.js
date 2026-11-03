@@ -211,3 +211,65 @@ test('P2 F6 adjacent: session logs with NUL bytes refuse (binary/truncated)', as
   const withNul = Buffer.concat([header, Buffer.from([0x00]), Buffer.from('\n')])
   assert.throws(() => readSessionFile(withNul, { compressed: false }), /NUL byte/)
 })
+
+// F8 residual: error.code/name/stage fields themselves must not carry the
+// runtime marker into the public report — the classifier whitelists only
+// this module's own uppercase codes.
+test('P2 F8 residual: raw error code/name/stage with the marker are classified out of the public report', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
+  const token = runtimeMarker()
+  const dir = mkdtempSync(join(tmpdir(), 'f8-fields-'))
+  try {
+    const { runImportJob } = await import('../lib/import/job.js')
+    const { ImportJournal } = await import('../lib/import/journal.js')
+    // a storage failure whose CODE (not just message) embeds the marker —
+    // simulating a lower layer that interpolates sensitive data into codes
+    const failingPersistence = {
+      stat: async () => { const e = new Error('boom'); e.code = `E_${token}`; e.stage = `stage-${token}`; throw e },
+      open: async () => { throw new Error('unreachable') },
+      list: async () => [],
+    }
+    const jobDir = join(dir, 'job')
+    mkdirSync(jobDir, { recursive: true })
+    const approvedPlan = {
+      digest: '0'.repeat(64),
+      sourceDigest: 'src-f8b',
+      target: { instanceFingerprint: 'inst-f8b' },
+      selected: ['f8b-s'],
+      excluded: [],
+      sessions: [],
+    }
+    const journal = ImportJournal.init(join(jobDir, 'journal.json'), { instanceFingerprint: 'inst-f8b', sourceDigest: 'src-f8b' }, { requirePlanApproval: true })
+    journal.approvePlan({ digest: approvedPlan.digest })
+    journal.transitionBatch('PLANNED')
+    let stdout = ''
+    let stderr = ''
+    const origOut = process.stdout.write.bind(process.stdout)
+    const origErr = process.stderr.write.bind(process.stderr)
+    process.stdout.write = chunk => { stdout += String(chunk); return true }
+    process.stderr.write = chunk => { stderr += String(chunk); return true }
+    let report
+    try {
+      report = await runImportJob({
+        jobDir,
+        instanceLockDir: join(dir, 'lock'),
+        instanceFingerprint: 'inst-f8b',
+        sourceDigest: 'src-f8b',
+        approvedPlan,
+        target: { persistence: failingPersistence, workspaceRegistry: undefined, workspaceUnitProvider: undefined },
+        sessions: [{ id: 'f8b-s', header: { version: 4, id: 'f8b-s' }, events: [], inheritedEventCount: 0 }],
+        withdrawSession: async () => {},
+        allowUnprotected: true,
+      })
+    } finally {
+      process.stdout.write = origOut
+      process.stderr.write = origErr
+    }
+    assert.equal(report.status, 'FAILED')
+    const hits = scanForMarker({ stdout, stderr, report: JSON.stringify(report) }, token)
+    assert.deepEqual(hits, [], `raw code/name/stage leaked the marker: ${hits}`)
+    assert.match(report.error.code, /^[A-Z][A-Z0-9_]{2,63}$/, 'the public code must be whitelist-classified')
+    assert.ok(!String(report.error.code).includes(token))
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
