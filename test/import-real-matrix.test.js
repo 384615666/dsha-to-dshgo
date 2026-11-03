@@ -659,3 +659,97 @@ test('P2 M4 B filesystem capability: a hard-link refusal is B_UNSUPPORTED with n
     await b.unmount()
   }
 })
+
+test('P2 M4 B directory I/O: open EIO is B_IO with the published fact preserved', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
+  const b = await mountTarget()
+  const origOpen = fs.openSync
+  try {
+    const { candidate, bytes } = await syntheticCandidate('m4-b-dir-open-eio', b.base)
+    fs.openSync = (path, flags, ...rest) => {
+      if (flags === 'r' && fs.statSync(path).isDirectory()) {
+        const error = new Error('injected directory open EIO')
+        error.code = 'EIO'
+        throw error
+      }
+      return origOpen(path, flags, ...rest)
+    }
+    let captured = null
+    await assert.rejects(
+      () => publishSessionViaB({ persistence: b.persistence, sessionsRoot: b.sessionsRoot, candidate, bytes }),
+      error => { captured = error; return error.code === 'B_IO' },
+    )
+    fs.openSync = origOpen
+    assert.equal(captured.published, true, 'the canonical file was already published')
+    assert.equal(captured.publishOutcome, 'published-directory-durability-unknown')
+    const located = b.persistence.locate({ cwd: candidate.header.cwd, id: candidate.header.id })
+    assert.ok(statSync(located.path, { throwIfNoEntry: false }), 'the published file is preserved for recovery')
+    const fresh = await mountAt(b.sessionsRoot)
+    try {
+      const read = await readAll(fresh.persistence, candidate.header.id)
+      assert.equal(sha(read.events), sha(candidate.events), 'the preserved file is the complete candidate')
+    } finally {
+      await fresh.unmount()
+    }
+    const leftovers = readdirSync(dirname(located.path)).filter(n => n.startsWith('.migrate-'))
+    assert.deepEqual(leftovers, [], 'the private staging file is removed')
+  } finally {
+    fs.openSync = origOpen
+    await b.unmount()
+  }
+})
+
+test('P2 M4 B directory I/O: directory fsync EIO is B_IO with the published fact preserved', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
+  const b = await mountTarget()
+  const origFsync = fs.fsyncSync
+  try {
+    const { candidate, bytes } = await syntheticCandidate('m4-b-dir-fsync-eio', b.base)
+    let calls = 0
+    fs.fsyncSync = fd => {
+      calls += 1
+      if (calls === 2) {
+        const error = new Error('injected directory fsync EIO')
+        error.code = 'EIO'
+        throw error
+      }
+      return origFsync(fd)
+    }
+    let captured = null
+    await assert.rejects(
+      () => publishSessionViaB({ persistence: b.persistence, sessionsRoot: b.sessionsRoot, candidate, bytes }),
+      error => { captured = error; return error.code === 'B_IO' },
+    )
+    fs.fsyncSync = origFsync
+    assert.equal(calls, 2, 'the second fsync is the directory barrier')
+    assert.equal(captured.published, true)
+    const read = await readAll(b.persistence, candidate.header.id)
+    assert.equal(sha(read.events), sha(candidate.events), 'the complete published file remains readable')
+  } finally {
+    fs.fsyncSync = origFsync
+    await b.unmount()
+  }
+})
+
+test('P2 M4 B directory I/O: a verified platform unsupported open is a recorded limitation', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
+  const b = await mountTarget()
+  const origOpen = fs.openSync
+  const platformCode = process.platform === 'win32' ? 'EPERM' : 'ENOSYS'
+  try {
+    const { candidate, bytes } = await syntheticCandidate('m4-b-dir-unsupported', b.base)
+    fs.openSync = (path, flags, ...rest) => {
+      if (flags === 'r' && fs.statSync(path).isDirectory()) {
+        const error = new Error('platform cannot open a directory read-only')
+        error.code = platformCode
+        throw error
+      }
+      return origOpen(path, flags, ...rest)
+    }
+    const res = await publishSessionViaB({ persistence: b.persistence, sessionsRoot: b.sessionsRoot, candidate, bytes })
+    fs.openSync = origOpen
+    assert.equal(res.steps.publish.ok, true)
+    assert.equal(res.steps.publish.directorySync, `directory-open-unsupported:${platformCode}`)
+    assert.equal(res.steps.readback.ok, true)
+  } finally {
+    fs.openSync = origOpen
+    await b.unmount()
+  }
+})
