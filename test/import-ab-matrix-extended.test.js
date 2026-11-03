@@ -64,6 +64,46 @@ async function buildCandidate(kind, id, cwd) {
   const req = createRequire(join(rc4Dir, 'noop.js'))
   const v23 = await import(pathToFileURL(req.resolve('@deepseek-ai/dsh-session-format-v2-to-v3')).href)
   const codec = v23.releasedV3SessionFormatCodec
+  if (kind === 'v1' || kind === 'v2') {
+    // Historical generations through the SAME official chain. v2 has the
+    // released encoder; v1 is decode-only, so its released physical rows are
+    // written directly (the packed text-chunks row expands to two events,
+    // exercising the v1 restorer's emitEvent contract).
+    let physicalHeader
+    let physicalRows
+    if (kind === 'v1') {
+      physicalHeader = { type: 'session', version: 1, id, createdAt: 1793500000000, cwd, delegationDepth: 0 }
+      physicalRows = [
+        e('turn/start', 0, { turn: 1 }),
+        e('step/start', 1, { turn: 1, step: 1 }),
+        { type: 'text-chunks', seq0: 2, time0: 102, data: { turn: 1, step: 1, index: 0, dt: [1], texts: ['A', 'B'] } },
+        e('step/end', 4, { turn: 1, step: 1 }),
+        e('turn/end', 5, { turn: 1, reason: { kind: 'completed' } }),
+      ]
+    } else {
+      const v12 = await import(pathToFileURL(req.resolve('@deepseek-ai/dsh-session-format-v1-to-v2')).href)
+      const codec2 = v12.releasedV2SessionFormatCodec
+      physicalHeader = codec2.encodeHeader({ version: 2, id, createdAt: 1793500000000, cwd, isSeeded: false, delegationDepth: 0 }, 0)
+      physicalRows = [
+        e('turn/start', 0, { turn: 1 }),
+        e('step/start', 1, { turn: 1, step: 1 }),
+        e('user/message', 2, { id: `${id}-u`, role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'v2 input' }] }, { surfaceOp: 'append' }),
+        e('step/end', 3, { turn: 1, step: 1 }),
+        e('turn/end', 4, { turn: 1, reason: { kind: 'completed' } }),
+      ].map(ev => codec2.encodeEvent(ev))
+    }
+    const out = await chain.migrateToV4(physicalHeader, physicalRows, { childFacts: [] })
+    const cat = (await import(pathToFileURL(req.resolve('@deepseek-ai/dsh-session-format-catalog')).href)).sessionFormatCatalog
+    const restore = cat.createRestore(out.headerRow, { recovery: 'strict', validation: 'current' })
+    for (const row of out.eventRows) restore.decodeRow(row)
+    const artifact = restore.finish()
+    return {
+      id,
+      header: { version: 4, id, createdAt: 1793500000000, cwd, isSeeded: false, delegationDepth: 0, agentPreset: 'standard' },
+      events: artifact.events,
+      inheritedEventCount: artifact.inheritedEventCount ?? 0,
+    }
+  }
   let logical
   let inheritedEventCount = 0
   let preset = 'standard'
@@ -160,9 +200,9 @@ const APPEND = (id, startSeq, turn) => [
   { type: 'turn/end', seq: startSeq + 2, time: 9_002, data: { turn, reason: { kind: 'completed' } } },
 ]
 
-const MATRIX_CASES = ['plain', 'compaction', 'seeded', 'preset-preserved', 'empty']
+const MATRIX_CASES = ['plain', 'compaction', 'seeded', 'preset-preserved', 'empty', 'v1', 'v2']
 
-test('P2 M4 extended A/B matrix: plain/compaction/seeded/preset-preserved/empty satisfy the same gates on both paths', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
+test('P2 M4 extended A/B matrix: plain/compaction/seeded/preset-preserved/empty/v1/v2 satisfy the same gates on both paths', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
   const matrix = []
   for (const kind of MATRIX_CASES) {
     const a = await mountTarget()
