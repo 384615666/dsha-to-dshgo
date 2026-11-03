@@ -17,15 +17,15 @@
 
 已实现并通过桌面隔离引擎与真实备份验证：
 
-- **输入**：DSHA v5 一键备份（gzip magic 识别，接受 `..gz` 等扩展名）；系统 files 选择器（≤8 MiB）路径。
-- **解析/恢复**：整包校验、白名单暂存、官方历史迁移链（v0–v3 → v4）、父子 catalog 绑定、官方 locate 位置校验。
+- **输入**：DSHA v5 一键备份（gzip magic 识别，接受 `..gz` 等扩展名）；系统 files 选择器（≤8 MiB）；产品级「Download/DSHA」扫描 + 流式暂存（>8 MiB 不再整文件进内存）。
+- **解析/恢复**：整包校验、白名单暂存、官方历史迁移链（v0–v3 → v4）、父子 catalog 绑定、官方 locate 位置校验；最高代不可用/ambiguous/非 canonical 名一律隔离并进入报告，不静默回退旧代。
 - **写入（A 路径）**：官方 `sessionPersistence.create/append/flush/close` + 全量语义读回；保留源会话 ID。
-- **附件**：附件先行发布（图片逐字节、文件 verbatim），官方读回后才创建会话；借用对象不撤回。
-- **安全**：G6 工作区完整单元快照、批准计划内容门禁、journal 持久化、受保护撤回回滚、用户改名/追加/新增引用保留并 pending。
+- **附件**：附件先行发布（图片逐字节、文件 verbatim），官方读回后才创建会话；失败/取消时本批新建对象移入 quarantine（不删除），共享对象保留。
+- **安全**：G6 工作区完整单元快照、批准计划内容门禁、journal 持久化、受保护撤回回滚、用户改名/追加/新增引用保留并 pending；进程崩溃遗留的实例锁/guard 会显示在恢复面板，经用户确认后可解除并继续回滚。
 - **原生面板**：选择备份 → 校验进度 → 分页选择会话 → preset/cwd 映射 → 确认计划 → 开始/取消 → 结果与恢复。P0 探针收在「开发工具」里。
 - **重复导入**：相同备份重跑会重新核验目标；一致显示「已完成」，目标被修改则要求恢复判断，不会静默追加。
 
-验证基线：`179` 项自动化测试（隔离 rc.4 引擎与真实备份夹具；三组环境分别运行）；SDK 清单/半宿主加载/中英文面板通过；npm 包门禁通过。旧代（v0–v3）只有合成夹具证据，**未在真实用户旧数据上验证**。
+验证基线：`208` 项自动化测试（隔离 rc.4 引擎与真实备份夹具；三组环境分别运行）；SDK 清单/半宿主加载/中英文面板通过；npm 包门禁通过。旧代（v0–v3）只有合成夹具证据，**未在真实用户旧数据上验证**。
 
 **尚未完成/未放行**：真机真实续聊已在可用的 `Glm 5.3 Flash` 通道通过（空会话对照、导入会话首发与重启后各一次）；导入会话原 `Flash` 通道因缺少 DeepSeek API Key 仍未通过。B 路径仍是实验入口，未接入统一作业；npm 发布与市场真实安装未执行。真机原生列表、工作区筛选、标题、重启和重开历史已在 Redmi 上通过。当前版本不要作为唯一数据副本使用。
 
@@ -44,8 +44,9 @@ dsh plugin --profile web add /root/.dsh/dsh-go/plugins/dsh-dsha-migrator
 ### 数据与隐私
 
 - 作业数据保存在 `<DSH_HOME>/dsha-migrator/`（journal、冻结计划、内容寻址快照、隔离区），文件 0600 / 目录 0700。
-- 导入成功后删除私有输入副本与候选暂存；journal/快照作为恢复点保留。
+- 导入成功后删除私有输入副本与候选暂存；journal/快照作为恢复点保留，结果页提供「删除本任务私有数据」入口。
 - 失败/取消按 G6 与受保护撤回补偿；无法判定的对象保持 pending 并保留最小证据。
+- 诊断 `devlist` 只写私有数据目录，不写 `/sdcard`；不输出 root/cwd/明文会话 id。
 - 卸载插件不影响已导入的会话。
 
 ### 开发探针环境变量（仅隔离实验）
@@ -82,15 +83,16 @@ A DSH bundle plugin that migrates sessions from a **DSHA** one-click backup into
 
 Implemented and verified against an isolated rc.4 engine with a real backup:
 
-- **Input**: DSHA v5 backup (gzip magic, accepts `..gz`); system files picker path (≤8 MiB).
-- **Parsing/restore**: full archive verification, allowlisted staging, official historical chain (v0–v3 → v4), parent/child catalog binding, official `locate()` location verification.
+- **Input**: DSHA v5 backup (gzip magic, accepts `..gz`); system files picker (≤8 MiB); product `Download/DSHA` scan + streaming staging for large files.
+- **Parsing/restore**: full archive verification, allowlisted staging, official historical chain (v0–v3 → v4), parent/child catalog binding, official `locate()` location verification; unavailable/ambiguous/non-canonical generations are isolated and reported instead of silently falling back.
 - **A-path write**: official `create/append/flush/close` plus full semantic readback; source session IDs preserved.
-- **Attachments**: published before sessions (images byte-for-byte, files verbatim), official readback before create; borrowed objects are never withdrawn.
-- **Safety**: complete G6 workspace-unit snapshot, approved-plan content gate, durable journal, protected withdrawal rollback, user edits/additions/new references preserved as pending.
+- **Attachments**: published before sessions (images byte-for-byte, files verbatim), official readback before create; created objects are quarantined (never deleted) on rollback, shared objects stay.
+- **Safety**: complete G6 workspace-unit snapshot, approved-plan content gate, durable journal, protected withdrawal rollback, user edits/additions/new references preserved as pending; stale crash locks/guards are inspectable and explicitly releasable from the recovery panel.
+- **Privacy**: task-private data under `$DSH_HOME/dsha-migrator/`, files 0600/directories 0700; explicit task-data deletion; diagnostics stay in the private data directory.
 - **Native panel**: pick backup → verify progress → paginated session selection → preset/cwd mapping → approve plan → start/cancel → result and recovery. P0 probes remain under Dev tools.
 - **Repeat import**: the same backup re-verifies the target; identical content reports done, a changed target requires recovery instead of silent appends.
 
-Baseline: `179` automated tests across three environments; SDK manifest/half-host load/zh-en panels pass; the npm package gate passes. Historical generations (v0–v3) have synthetic fixtures only — **not validated against real user legacy data**.
+Baseline: `208` automated tests across three environments; SDK manifest/half-host load/zh-en panels pass; the npm package gate passes. Historical generations (v0–v3) have synthetic fixtures only — **not validated against real user legacy data**.
 
 **Not released yet**: real continuation passed on the available `Glm 5.3 Flash` channel (an empty control, plus the imported session before and after restart); the imported session's original `Flash` channel still fails without a DeepSeek API key. B path remains an experimental entry and is not wired into the job; npm publishing and market installation are not done. Native list, workspace filter, titles, restart and history reopening pass on the Redmi. Do not use this version as the only copy of your data.
 

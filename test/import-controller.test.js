@@ -4,7 +4,7 @@
 // real backup is read-only.
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, mkdirSync, rmSync, existsSync, readFileSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, rmSync, existsSync, readFileSync, writeFileSync, utimesSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createRequire } from 'node:module'
@@ -328,6 +328,22 @@ test('P3 R4: a fresh controller resumes a pending journal from the PERSISTED pla
     assert.equal(failed.status, 'ROLLBACK_PENDING', JSON.stringify(failed))
     assert.ok(await engine.persistence.stat('r4-s'), 'the pending session remains for recovery')
 
+    // Simulate a process that died while holding the instance lock: the lock
+    // file exists with an old mtime and no live owner. The panel must be able
+    // to inspect it, refuse a young lock, and reclaim this stale generation
+    // only after the explicit recovery action.
+    const lockDir = join(dataRoot, 'instance-lock')
+    mkdirSync(lockDir, { recursive: true })
+    writeFileSync(join(lockDir, 'import-job.lock'), JSON.stringify({
+      instanceFingerprint: fp,
+      ownerId: 'crashed-owner',
+      generation: 'crashed-generation',
+      pid: 999999,
+      at: new Date(0).toISOString(),
+    }))
+    const old = new Date(Date.now() - 120_000)
+    utimesSync(join(lockDir, 'import-job.lock'), old, old)
+
     const controller = createMigrationController()
     controller.setServices({
       sessionPersistence: engine.persistence,
@@ -339,7 +355,9 @@ test('P3 R4: a fresh controller resumes a pending journal from the PERSISTED pla
       await new Promise(resolve => setTimeout(resolve, 10))
     }
     assert.equal(controller.snapshot().phase, 'recovery_required', JSON.stringify(controller.snapshot()))
-    await controller.resumeRollback()
+    assert.equal(controller.inspectLock().held, true)
+    assert.equal(controller.inspectLock().canBreak, true)
+    await controller.unlockAndResume()
     const snap = controller.snapshot()
     assert.equal(snap.result?.errorCode, null, JSON.stringify(snap.result))
     // The confirmed session import is compensated; the OPEN attach intent

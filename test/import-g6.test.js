@@ -944,3 +944,37 @@ test('P2 fallback policy: an UNPROTECTED withdrawal adapter is refused by defaul
   assert.equal(calls, 1)
   void lab
 })
+
+test('P3.2 state machine: ROLLBACK_PENDING completes to ROLLED_BACK through the recorded two-step; every gate still applies', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'p32-journal-'))
+  try {
+    const file = join(dir, 'journal.json')
+    const journal = ImportJournal.init(file, { instanceFingerprint: 'inst-p32', sourceDigest: 'src-p32' })
+    journal.transitionBatch('PLANNED')
+    journal.transitionBatch('SNAPSHOT_READY')
+    journal.transitionBatch('ROLLING_BACK')
+    journal.recordRollback({ outcome: 'pending', verification: { ok: false, diffs: ['user rename preserved'] } })
+    assert.equal(journal.state.batchState, 'ROLLBACK_PENDING')
+    // 1) a PENDING verdict cannot be turned into a terminal ROLLED_BACK
+    assert.throws(() => journal.transitionBatch('ROLLED_BACK'), /ROLLED_BACK refused/)
+    // 2) the open-intent gate is unchanged on the completion path
+    const seq = journal.intent({ type: 'session.import', sessionId: 'p32-s' })
+    journal.recordRollback({ outcome: 'complete', verification: { ok: true, diffs: [] } })
+    assert.throws(() => journal.transitionBatch('ROLLED_BACK'), /unconfirmed action intent/)
+    journal.confirm(seq, { revision: 'r1' })
+    // 3) completion now goes through the recorded two-step
+    journal.transitionBatch('ROLLED_BACK')
+    assert.equal(journal.state.batchState, 'ROLLED_BACK')
+    const tail = journal.state.history.slice(-2).map(h => [h.from, h.to])
+    assert.deepEqual(tail, [['ROLLBACK_PENDING', 'ROLLING_BACK'], ['ROLLING_BACK', 'ROLLED_BACK']],
+      `completion must record the intermediate phase: ${JSON.stringify(journal.state.history)}`)
+    // 4) durable: a reload reads the same terminal state (never a replay)
+    const reloaded = ImportJournal.load(file, { instanceFingerprint: 'inst-p32', sourceDigest: 'src-p32' })
+    assert.equal(reloaded.state.batchState, 'ROLLED_BACK')
+    assert.equal(reloaded.recovered, false)
+    // ROLLED_BACK is terminal
+    assert.throws(() => reloaded.transitionBatch('ROLLING_BACK'), /illegal batch journal transition/)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})

@@ -646,3 +646,130 @@ test('R4 matrix: parent WITHOUT catalog rows + legal matching fact → chain add
   const canonical = await encodeCanonicalV4AndSelfCheck(parent.artifact)
   assert.equal(canonical.headerRow.version, 4)
 })
+
+// ---------------------------------------------------------------------------
+// CORE-AUDIT B3 (P1-3): the four LEGACY classes are decided from structured
+// evidence (official class name, cause chain, migration package/subject,
+// stage) with a table of EXACT official refusal texts. The previous English
+// word-regex mapping misclassified 4 of these 7 real child-evidence refusals.
+// ---------------------------------------------------------------------------
+
+const officialRefusal = message => Object.assign(new Error(message), { name: 'SessionFormatUnsupportedMigrationError' })
+const officialFormatError = message => Object.assign(new Error(message), { name: 'SessionFormatError' })
+
+test('B3: official refusal texts map to their precise LEGACY class (table-driven, rc.4 verbatim)', async () => {
+  // Pure classification: no official module needs to be loaded for this table.
+  const { classifyOfficialFailure, LEGACY_CODES } = await import('../lib/migration/legacy-chain.js')
+  const CHILD = LEGACY_CODES.CHILD_EVIDENCE_INCOMPLETE
+  const CHRONO = LEGACY_CODES.CHRONOLOGY_UNREACHABLE
+  const HEADER = LEGACY_CODES.HEADER_UNSUPPORTED
+  const ROW = LEGACY_CODES.ROW_DECODE_FAILED
+  const v3Prefix = '@deepseek-ai/dsh-session-format-v3-to-v4 refuses this format v3 Session: '
+  const cases = [
+    // --- the seven child-evidence refusals measured in CORE-AUDIT B3 --------
+    ['catalog migration requires a subagent child with a direct parent', officialRefusal('catalog migration requires a subagent child with a direct parent'), CHILD],
+    ['invalid descriptor provider', officialRefusal(`${v3Prefix}Session child-1 has an invalid subagent descriptor provider`), CHILD],
+    ['invalid descriptor mode', officialRefusal(`${v3Prefix}Session child-1 has an invalid subagent descriptor mode`), CHILD],
+    ['historical child identity evidence', officialRefusal('catalog migration requires historical child identity and descriptor evidence'), CHILD],
+    ['explicit historical child facts', officialRefusal(`${v3Prefix}V3 catalog migration requires explicit historical child facts, including an empty array for a parent without children`), CHILD],
+    ['parent-catalog conflict', officialRefusal(`${v3Prefix}Session child-1 conflicts with its parent catalog`), CHILD],
+    ['duplicate catalog child', officialRefusal(`${v3Prefix}duplicate catalog child child-1`), CHILD],
+    // --- chronology (dsh-session-format-v2-to-v3 refusals) -------------------
+    ['v2 surface before first step', officialRefusal('format v2 surface before first step cannot acquire a system head without changing chronology'), CHRONO],
+    ['v2 prompt change outside a step', officialRefusal('format v2 changed request prompt outside an open step cannot retain source chronology'), CHRONO],
+    // --- row/event-level refusals -------------------------------------------
+    ['v0 unknown historical event type', officialRefusal('format v0 contains unknown historical event type "request/header-delta" at seq 3; migration refuses unknown historical events even when ignorable'), ROW],
+    ['v1 unknown required event type', officialRefusal('format v1 contains unknown required event type "mode/set" at seq 2'), ROW],
+    ['v4 retired event type', officialRefusal('format v4 rejects retired event type tool/code-dispatch-start'), ROW],
+    ['v3 unknown event type', officialRefusal('format v3 contains unknown event type "x/y" at seq 2'), ROW],
+    ['unclassified message source', officialRefusal('cannot safely transform unclassified message source'), ROW],
+    ['delivery marker claims target format', officialRefusal('format v3 delivery marker claims target format v4'), ROW],
+    // --- header capability refusals ----------------------------------------
+    ['wrapped header transform (subject named)', officialRefusal('@deepseek-ai/dsh-session-format-v3-to-v4 refuses this format v3 Session header: format v3 header has unexpected field tool'), HEADER],
+    ['newer stored format', officialRefusal('stored Session uses newer format v5; this build writes v4'), HEADER],
+    ['missing migration in this build', officialRefusal('Session migration v5->v6 is missing'), HEADER],
+    // --- non-refusal official losslessness failure --------------------------
+    ['plain SessionFormatError', officialFormatError('format v4 event 3 is not dense'), ROW],
+  ]
+  for (const [label, error, expected] of cases) {
+    const result = classifyOfficialFailure(error, { stage: 'restore-finish', storedVersion: 3 })
+    assert.equal(result.code, expected, `${label}: got ${result.code} (${result.message.slice(0, 80)})`)
+  }
+  // The default is stage-aware: an unmatched refusal while decoding a row is a
+  // row failure; at finish time it is a header/format capability refusal.
+  assert.equal(classifyOfficialFailure(officialRefusal('some future refusal wording'), { stage: 'row-decode', storedVersion: 2 }).code, ROW)
+  assert.equal(classifyOfficialFailure(officialRefusal('some future refusal wording'), { stage: 'restore-finish', storedVersion: 2 }).code, HEADER)
+})
+
+test('B3: classification uses the official class, cause chain, migration prefix and stage — not English word regexes', async () => {
+  const { classifyOfficialFailure, normalizeFinishError, LEGACY_CODES, LegacyMigrationError } = await import('../lib/migration/legacy-chain.js')
+  // The detail can live ONLY on the cause: the wrapped message is truncated.
+  const inner = officialRefusal('Session child-9 has an invalid subagent descriptor mode')
+  const wrapped = officialRefusal('@deepseek-ai/dsh-session-format-v3-to-v4 refuses this format v3 Session: ')
+  wrapped.cause = inner
+  const byCause = classifyOfficialFailure(wrapped, { stage: 'parent-restore-finish', storedVersion: 3 })
+  assert.equal(byCause.code, LEGACY_CODES.CHILD_EVIDENCE_INCOMPLETE)
+  // structured details for the report (migration package, subject, stage, cause)
+  assert.equal(byCause.details.migration, '@deepseek-ai/dsh-session-format-v3-to-v4')
+  assert.equal(byCause.details.stage, 'parent-restore-finish')
+  assert.equal(byCause.details.storedVersion, 3)
+  assert.equal(byCause.details.cause, 'SessionFormatUnsupportedMigrationError')
+  const headerRefusal = classifyOfficialFailure(
+    officialRefusal('@deepseek-ai/dsh-session-format-v3-to-v4 refuses this format v3 Session header: nope'),
+    { stage: 'restore-finish', storedVersion: 3 },
+  )
+  assert.equal(headerRefusal.details.subject, 'Session header')
+  assert.equal(headerRefusal.code, LEGACY_CODES.HEADER_UNSUPPORTED)
+  // normalizeFinishError wraps once, keeps the cause, and an already-classified
+  // error passes through unchanged.
+  const normalized = normalizeFinishError(wrapped, { stage: 'parent-restore-finish', storedVersion: 3 })
+  assert.equal(normalized.code, LEGACY_CODES.CHILD_EVIDENCE_INCOMPLETE)
+  assert.equal(normalized.cause, wrapped)
+  const already = new LegacyMigrationError(LEGACY_CODES.CHRONOLOGY_UNREACHABLE, 'kept', { stage: 'x' })
+  assert.equal(normalizeFinishError(already), already)
+  assert.equal(classifyOfficialFailure(already).code, LEGACY_CODES.CHRONOLOGY_UNREACHABLE)
+  // a non-official error is still a losslessness failure, never HEADER_UNSUPPORTED
+  assert.equal(classifyOfficialFailure(new TypeError('boom'), { stage: 'restore-finish' }).code, LEGACY_CODES.ROW_DECODE_FAILED)
+})
+
+test('B3: real rc.4 refusals classify through the real entry points (child fact + duplicate catalog)', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
+  const { childFactsFromArtifacts, restoreParentWithChildren, LEGACY_CODES } = await loadChain()
+  const req = createRequire(join(rc4Dir, 'noop.js'))
+  const cat = await import(pathToFileURL(req.resolve('@deepseek-ai/dsh-session-format-catalog')).href)
+  const e = (type, seq, data) => ({ type, seq, time: seq + 100, data })
+
+  // A child artifact whose descriptor lacks `provider`: the OFFICIAL child-fact
+  // builder refuses it; the classification must be child-evidence, not a raw
+  // official error leaking into the report.
+  const childHeader = { type: 'session', version: 3, id: 'child-x', createdAt: 1793500001000, cwd: '/w', isSeeded: false, delegationDepth: 1, origin: 'subagent', parentSession: 'p' }
+  const childRestore = cat.historicalSessionFormatCatalog.createRestore(childHeader, { recovery: 'strict', validation: 'current' })
+  for (const row of [e('turn/start', 0, { turn: 1 }), e('subagent/descriptor', 1, { version: 1, mode: 'continuable', label: 'l' }), e('turn/end', 2, { turn: 1, reason: { kind: 'completed' } })]) childRestore.decodeRow(row)
+  const childArtifact = childRestore.finish()
+  await assert.rejects(
+    () => childFactsFromArtifacts([childArtifact]),
+    error => {
+      assert.equal(error.code, LEGACY_CODES.CHILD_EVIDENCE_INCOMPLETE, `got ${error.code}: ${error.message}`)
+      assert.equal(error.details.stage, 'child-facts')
+      assert.equal(error.details.migration, '@deepseek-ai/dsh-session-format-v3-to-v4')
+      return true
+    },
+  )
+
+  // Parent rows declaring the SAME catalog child twice: the official chain
+  // refuses at finish with "duplicate catalog child"; child-evidence class.
+  const parentHeader = { type: 'session', version: 3, id: 'p-dupcat', createdAt: 1, cwd: '/w', isSeeded: false, delegationDepth: 0 }
+  const duplicateRows = [
+    e('turn/start', 0, { turn: 1 }),
+    e('subagent/catalog', 1, { childId: 'c1', mode: 'continuable', version: 1, provider: 'p', label: 'l', childCreatedAt: 5 }),
+    e('subagent/catalog', 2, { childId: 'c1', mode: 'continuable', version: 1, provider: 'p', label: 'l', childCreatedAt: 5 }),
+    e('turn/end', 3, { turn: 1, reason: { kind: 'completed' } }),
+  ]
+  await assert.rejects(
+    () => restoreParentWithChildren(parentHeader, duplicateRows, []),
+    error => {
+      assert.equal(error.code, LEGACY_CODES.CHILD_EVIDENCE_INCOMPLETE, `got ${error.code}: ${error.message}`)
+      assert.match(error.message, /duplicate catalog child/i)
+      return true
+    },
+  )
+})

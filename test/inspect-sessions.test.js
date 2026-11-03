@@ -20,7 +20,7 @@ import { join, relative, sep } from 'node:path'
 import zlib from 'node:zlib'
 import { createRequire } from 'node:module'
 import { pathToFileURL } from 'node:url'
-import { inspectSessions, readSessionFile } from '../lib/inspect-sessions.js'
+import { inspectSessions, readSessionFile, canonicalGeneration, assertChildCatalogPreserved, CANONICAL_SESSION_LOG_RE } from '../lib/inspect-sessions.js'
 import { setLocationAdapter } from '../lib/migration/location.js'
 import { splitZstdFrames, decompressZstdMultiFrame } from '../lib/archive/zstd-frames.js'
 import { buildV5Archive, fileEntry, missingEntry } from './helpers/v5-fixture.mjs'
@@ -78,6 +78,14 @@ function sessionFile(root, scope, project, sessionId, fileName, content) {
 }
 
 const text = t => Buffer.from(t)
+
+// A declared NON-FILE canonical slot of an explicit kind (MISSING/UNREADABLE/
+// LINK/EXCLUDED). Source record contract: non-FILE records carry size 0 and an
+// empty digest; LINK additionally names a portable target.
+function slotEntry(root, path, kind, scope = 'sessions') {
+  const extra = kind === 'LINK' ? { target: '/w/session.v4.jsonl' } : {}
+  return fileEntry(root, path, Buffer.alloc(0), scope, { kind, size: 0, sha256: '', ...extra })
+}
 
 // Multi-frame zstd: DSHA session logs are concatenated frames (first frame =
 // the one-line header). Node's zstdDecompressSync handles exactly one frame,
@@ -290,8 +298,28 @@ function v3SessionBytes(codec, id, { origin, parentSession, descriptor, cwd = '/
   ])
 }
 
-test('F2: parent + direct subagent child binds evidence (catalog event added); unrelated child stays unmatched', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
-  await injectLoader()
+// Current-generation (v4) physical session bytes through the OFFICIAL catalog.
+// Used for dependency-group tests: a v4 child needs no child facts, so it would
+// otherwise import standalone even when its historical parent is isolated.
+async function v4SessionBytes(id, { parentSession } = {}) {
+  const req = createRequire(join(rc4Dir, 'noop.js'))
+  const cat = await import(pathToFileURL(req.resolve('@deepseek-ai/dsh-session-format-catalog')).href)
+  const e = (type, seq, data) => ({ type, seq, time: seq + 100, data })
+  const header = cat.sessionFormatCatalog.encodeCurrentHeader({
+    version: 4,
+    id,
+    createdAt: 1793500001000,
+    cwd: '/w',
+    isSeeded: false,
+    delegationDepth: parentSession ? 1 : 0,
+    ...(parentSession ? { origin: 'subagent', parentSession } : {}),
+  }, 0)
+  const rows = [e('turn/start', 0, { turn: 1 }), e('turn/end', 1, { turn: 1, reason: { kind: 'completed' } })]
+    .map(ev => cat.sessionFormatCatalog.encodeCurrentEvent(ev))
+  return Buffer.from([JSON.stringify(header), ...rows.map(r => JSON.stringify(r))].join('\n') + '\n')
+}
+
+test('F2: parent + direct subagent child binds evidence (catalog event added); unrelated child stays unmatched', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {  await injectLoader()
   const unmount = await mountLocation()
   const codec = await v3codec()
   const dir = mkdtempSync(join(tmpdir(), 'f2-bind-'))
@@ -358,11 +386,11 @@ test('F2: v4 direct child binds through the official chain (no blanket version r
   }
 })
 
-test('F2: standalone historical parent restores with the scanned-empty set; verified unreadable child yields an unavailable fact; UNVERIFIED salvage identity yields none', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
+test('F2: clean scan — standalone historical parent restores with the scanned-empty set; verified unreadable child yields an unavailable fact', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
   await injectLoader()
   const unmount = await mountLocation()
   const codec = await v3codec()
-  const dir = mkdtempSync(join(tmpdir(), 'f2-empty-'))
+  const dir = mkdtempSync(join(tmpdir(), 'f2-clean-'))
   try {
     // parent with a child whose HEADER parses but rows are corrupt — the
     // header sits at the child's OWN official directory (identity verified)
@@ -370,8 +398,63 @@ test('F2: standalone historical parent restores with the scanned-empty set; veri
       Buffer.from(JSON.stringify(codec.encodeHeader({ version: 3, id: 'child-bad', createdAt: 1793500001000, cwd: '/w', isSeeded: false, delegationDepth: 1, origin: 'subagent', parentSession: 'p-with-bad' }, 0)) + '\n'),
       Buffer.from('{"type":"turn/start" NOT_JSON\n'),
     ])
+    const gz = buildV5Archive([
+      fileEntry('sessions', `${officialDirFor('solo-p')}/session.v3.jsonl`, v3SessionBytes(codec, 'solo-p'), 'sessions'),
+      fileEntry('sessions', `${officialDirFor('p-with-bad')}/session.v3.jsonl`, v3SessionBytes(codec, 'p-with-bad'), 'sessions'),
+      fileEntry('sessions', `${officialDirFor('child-bad')}/session.v3.jsonl`, corruptChild, 'sessions'),
+    ])
+    const backup = join(dir, 'b.gz')
+    writeFileSync(backup, gz)
+    const r = await inspectSessions(backup, { stagingRoot: join(dir, 'staging') })
+    const byId = new Map(r.sessions.map(s => [s.id, s]))
+    const solo = byId.get('solo-p')
+    const pBad = byId.get('p-with-bad')
+    const badChild = byId.get('child-bad')
+    // Every slot here has a VERIFIED identity, so the child scan is complete
+    // and an empty fact set is a real statement — not a placeholder for
+    // "evidence we failed to read".
+    assert.equal(r.childEvidence.complete, true)
+    assert.deepEqual(r.childEvidence.unattributed, [])
+    assert.equal(solo.status, 'restored', 'standalone parent must restore with the scanned-empty set')
+    assert.equal(solo.importable, true)
+    assert.equal(solo.canonicalEvents, 2, 'no direct children → no catalog event added')
+    assert.deepEqual(solo.childEvidence, { status: 'closed', declared: 0, bound: 0, unavailable: 0 })
+    // unreadable child is REPORTED (never silently dropped) …
+    assert.equal(badChild.status, 'refused')
+    assert.equal(badChild.code, 'SESSION_ROW_MALFORMED')
+    assert.equal(badChild.reason, 'row-malformed')
+    assert.ok(!JSON.stringify(r).includes('NOT_JSON'), 'fixed error text must not echo the damaged row')
+    // … and its VERIFIED identity feeds the parent an explicit
+    // empty-descriptor fact; the official chain decides (accepted: 2 own → 3).
+    assert.deepEqual(r.childEvidence.declared, [
+      { parent: 'p-with-bad', child: 'child-bad', mode: 'unavailable-fact', sourceDirectory: officialDirFor('child-bad') },
+    ])
+    assert.equal(pBad.status, 'restored')
+    assert.equal(pBad.importable, true)
+    assert.equal(pBad.canonicalEvents, 3)
+    assert.deepEqual(pBad.childEvidence, {
+      status: 'closed', declared: 1, bound: 0, unavailable: 1,
+      unavailableChildren: [{ child: 'child-bad', code: 'SESSION_ROW_MALFORMED' }],
+    })
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+    await unmount()
+  }
+})
+
+test('B1: a declared-unavailable or unverifiable session slot isolates EVERY historical parent (never a silent empty child set)', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
+  await injectLoader()
+  const unmount = await mountLocation()
+  const codec = await v3codec()
+  const dir = mkdtempSync(join(tmpdir(), 'b1-close-'))
+  try {
+    const corruptChild = Buffer.concat([
+      Buffer.from(JSON.stringify(codec.encodeHeader({ version: 3, id: 'child-bad', createdAt: 1793500001000, cwd: '/w', isSeeded: false, delegationDepth: 1, origin: 'subagent', parentSession: 'p-with-bad' }, 0)) + '\n'),
+      Buffer.from('{"type":"turn/start" NOT_JSON\n'),
+    ])
     // an IMPOSTOR: header claims a different id than its directory — the
-    // location check must disqualify it from contributing ANY fact.
+    // location check disqualifies it, so its identity cannot be used to close
+    // any parent's child set (and cannot be assumed unrelated either).
     const impostor = Buffer.concat([
       Buffer.from(JSON.stringify(codec.encodeHeader({ version: 3, id: 'impostor', createdAt: 1793500002000, cwd: '/w', isSeeded: false, delegationDepth: 1, origin: 'subagent', parentSession: 'p-with-bad' }, 0)) + '\n'),
       Buffer.from('{"type":"turn/start" ALSO_BROKEN\n'),
@@ -388,26 +471,31 @@ test('F2: standalone historical parent restores with the scanned-empty set; veri
     const backup = join(dir, 'b.gz')
     writeFileSync(backup, gz)
     const r = await inspectSessions(backup, { stagingRoot: join(dir, 'staging') })
-    const solo = r.sessions.find(s => s.id === 'solo-p')
-    const pBad = r.sessions.find(s => s.id === 'p-with-bad')
-    const badChild = r.sessions.find(s => s.id === 'child-bad')
-    const imp = r.sessions.find(s => s.id === 'honest-child')
-    assert.equal(solo.status, 'restored', 'standalone parent must restore with the scanned-empty set')
-    assert.equal(solo.importable, true)
-    // unreadable child is REPORTED (never silently dropped) …
-    assert.equal(badChild.status, 'refused')
-    assert.equal(badChild.code, 'SESSION_ROW_MALFORMED')
-    assert.ok(!JSON.stringify(r).includes('NOT_JSON'), 'fixed error text must not echo the damaged row')
-    // … and its VERIFIED identity feeds the parent an explicit
-    // empty-descriptor fact; the official chain decides (accepted: 2 own → 3).
-    assert.ok(r.childEvidence.declared.some(d => d.parent === 'p-with-bad' && d.child === 'child-bad' && d.mode === 'unavailable-fact'))
-    assert.equal(pBad.status, 'restored')
-    assert.equal(pBad.importable, true)
-    assert.equal(pBad.canonicalEvents, 3)
-    // the impostor failed the location binding → refused, and contributed NO fact
-    assert.equal(imp.status, 'refused')
-    assert.equal(imp.code, 'LEGACY_LOCATION_MISMATCH')
+    const byId = new Map(r.sessions.map(s => [s.id, s]))
+    // The scan cannot be closed: one declared-missing slot and one unverifiable
+    // identity exist. Any of them COULD be a direct child, so NO historical
+    // parent may be restored with an assumed-empty child set (CORE B1).
+    assert.equal(r.childEvidence.complete, false)
+    assert.deepEqual(r.childEvidence.declared, [], 'no fact may be bound from an unclosed scan')
+    const expectedUnattributed = [officialDirFor('ghost'), officialDirFor('honest-child')].sort()
+    for (const id of ['solo-p', 'p-with-bad']) {
+      const row = byId.get(id)
+      assert.equal(row.status, 'refused', `${id} must be isolated, not restored with []`)
+      assert.equal(row.code, 'LEGACY_CHILD_EVIDENCE_INCOMPLETE')
+      assert.equal(row.reason, 'child-evidence-incomplete')
+      assert.equal(row.importable, false)
+      assert.equal(row.childEvidence.status, 'incomplete')
+      assert.deepEqual(row.childEvidence.unattributedSlots.map(s => s.directory).sort(), expectedUnattributed)
+    }
+    assert.equal(byId.get('ghost').code, 'LEGACY_GENERATION_UNAVAILABLE')
+    assert.equal(byId.get('ghost').reason, 'highest-generation-unavailable')
+    assert.equal(byId.get('honest-child').code, 'LEGACY_LOCATION_MISMATCH')
     assert.ok(!r.childEvidence.declared.some(d => d.child === 'impostor'), 'unverified salvage identity must never become a fact')
+    assert.equal(byId.get('child-bad').code, 'SESSION_ROW_MALFORMED')
+    assert.equal(r.counts.total, 5)
+    assert.equal(r.counts.importable, 0)
+    assert.equal(r.counts.refused, 5)
+    assert.equal(r.counts.isolated, 1, 'only the missing-generation directory is a directory-level isolation here')
     // declared MISSING slot survives into the report
     assert.deepEqual(r.childEvidence.declaredMissing, [{ path: `${officialDirFor('ghost')}/session.v3.jsonl`, kind: 'MISSING' }])
   } finally {
@@ -430,11 +518,11 @@ test('F4: official location binding admits correct/canonical-encoded directories
     // characters are NOT the directory encoding.
     const { officialSessionDirectory } = await import('../lib/migration/location.js')
     const cjkDir = officialSessionDirectory({ cwd: '/w', id: '会话-id' })
-    const gz = buildV5Archive([
+    // Archive A: binding/duplicate/generation cases (every candidate is v4, so
+    // no historical parent's child-evidence scan depends on them).
+    const gzA = buildV5Archive([
       // legal v4 header inside a v1-named file: generation mismatch
       fileEntry('sessions', `${officialDirFor('s-gen')}/session.v1.jsonl`, v4, 'sessions'),
-      // v0 compressed canonical name must be SELECTED (gen 0)
-      fileEntry('sessions', `${officialDirFor('s-v0z')}/session.jsonl.zstd`, zlib.zstdCompressSync(v0z), 'sessions'),
       // same id from two directories (each at its OWN official location):
       // BOTH isolated
       fileEntry('sessions', `--w--/s-dup/session.v4.jsonl`, dupA, 'sessions'),
@@ -443,21 +531,33 @@ test('F4: official location binding admits correct/canonical-encoded directories
       // locate() assigns the encoded directory segment)
       fileEntry('sessions', `${cjkDir}/session.v4.jsonl`, cjk, 'sessions'),
     ])
-    const backup = join(dir, 'b.gz')
-    writeFileSync(backup, gz)
-    const r = await inspectSessions(backup, { stagingRoot: join(dir, 'staging') })
-    const byId = new Map(r.sessions.map(s => [s.id, s]))
+    const backupA = join(dir, 'a.gz')
+    writeFileSync(backupA, gzA)
+    const rA = await inspectSessions(backupA, { stagingRoot: join(dir, 'staging-a') })
+    const byId = new Map(rA.sessions.map(s => [s.id, s]))
     assert.equal(byId.get('s-gen').code, 'LEGACY_GENERATION_MISMATCH', `got ${byId.get('s-gen').error}`)
     assert.equal(byId.get('s-gen').sourceGeneration, 1, 'source generation comes from the FILENAME')
-    const v0zEntry = byId.get('s-v0z')
-    assert.equal(v0zEntry.sourceGeneration, 0, 'session.jsonl.zstd is the v0 canonical and must not vanish')
-    assert.equal(v0zEntry.importable, true, 'header-only v0 follows the official chain verdict')
-    const dups = r.sessions.filter(s => s.code === 'LEGACY_DUPLICATE_SESSION_ID')
+    assert.equal(byId.get('s-gen').reason, 'generation-mismatch')
+    const dups = rA.sessions.filter(s => s.code === 'LEGACY_DUPLICATE_SESSION_ID')
     assert.equal(dups.length, 2, 'both same-id candidates isolated')
-    assert.equal(r.counts.importable, 2, 'v0 canonical + official-encoded CJK session; neither duplicate counts')
-    const cjkEntry = r.sessions.find(s => s.headerVersion === 4 && s.binding?.location === 'official-locate' && s.importable && s.id !== 's-v0z' && s.id !== 's-gen')
+    assert.equal(dups[0].reason, 'duplicate-session-id')
+    assert.equal(rA.counts.total, 4, 'refused rows count too')
+    assert.equal(rA.counts.importable, 1, 'only the official-encoded CJK session; neither duplicate counts')
+    const cjkEntry = rA.sessions.find(s => s.headerVersion === 4 && s.binding?.location === 'official-locate' && s.importable)
     assert.ok(cjkEntry, 'the official-encoded CJK id must be admitted')
     assert.ok(cjkEntry.id.startsWith('~'), `encoded directory segment is the reported slot id (got ${cjkEntry.id})`)
+    // Archive B: v0 compressed canonical name must be SELECTED (gen 0) and,
+    // in a clean scan, restored with the scanned-empty child set.
+    const gzB = buildV5Archive([
+      fileEntry('sessions', `${officialDirFor('s-v0z')}/session.jsonl.zstd`, zlib.zstdCompressSync(v0z), 'sessions'),
+    ])
+    const backupB = join(dir, 'b.gz')
+    writeFileSync(backupB, gzB)
+    const rB = await inspectSessions(backupB, { stagingRoot: join(dir, 'staging-b') })
+    const v0zEntry = rB.sessions[0]
+    assert.equal(v0zEntry.sourceGeneration, 0, 'session.jsonl.zstd is the v0 canonical and must not vanish')
+    assert.equal(v0zEntry.importable, true, 'header-only v0 follows the official chain verdict')
+    assert.equal(rB.childEvidence.complete, true)
   } finally {
     rmSync(dir, { recursive: true, force: true })
     await unmount()
@@ -676,6 +776,420 @@ test('selection: a declared-missing highest generation blocks fallback; a presen
     assert.equal(plain.importable, true)
     assert.equal(plain.sourceGeneration, 3)
     assert.equal(plain.outputGeneration, 4)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+    await unmount()
+  }
+})
+
+// ---------------------------------------------------------------------------
+// CORE-AUDIT P1-2/P1-4/P1-1/P2-4 (B2/B4/B1/B5): unified session-directory
+// availability, counted isolation rows, child-evidence closure, and official
+// canonical filename semantics.
+// ---------------------------------------------------------------------------
+
+// The corpus is checked against the OFFICIAL parser in the RC4-gated test
+// below; these expectations are the official rule (`session.jsonl` = v0,
+// `session.vN.jsonl` for N ≥ 1, each optionally `.zstd`) written out so the
+// suite still proves the rule without RC4_MODULES.
+const CANONICAL_CASES = [
+  ['session.jsonl', 0],
+  ['session.jsonl.zstd', 0],
+  ['session.v1.jsonl', 1],
+  ['session.v2.jsonl.zstd', 2],
+  ['session.v3.jsonl', 3],
+  ['session.v4.jsonl', 4],
+  ['session.v4.jsonl.zstd', 4],
+  ['session.v129.jsonl', 129],
+]
+const NON_CANONICAL_NAMES = [
+  'session.v0.jsonl', // .v0 is never a canonical generation name
+  'session.v0.jsonl.zstd',
+  'session.v01.jsonl', // leading zero
+  'session.v04.jsonl',
+  'session.v00.jsonl',
+  'Session.v4.jsonl', // case variants
+  'session.V4.jsonl',
+  'session.v4.JSONL',
+  'session.v4.jsonl.ZSTD',
+  'session.v4.jsonl.tmp', // temporary names
+  'session.tmp.jsonl',
+  'session.v4.jsonl.bak',
+  'session.lock',
+  'session.jsonl.tmp',
+  'notes.jsonl',
+  'session.jsonl.bak',
+]
+
+test('B5: canonical generation names are the OFFICIAL ones; .v0/leading zeros/case variants are not generation slots', async () => {
+  for (const [name, expected] of CANONICAL_CASES) {
+    assert.equal(canonicalGeneration(name), expected, name)
+    assert.equal(CANONICAL_SESSION_LOG_RE.test(name), true, `${name} must be a canonical slot`)
+  }
+  for (const name of NON_CANONICAL_NAMES) {
+    assert.equal(canonicalGeneration(name), -1, `${name} must not identify a generation`)
+    assert.equal(CANONICAL_SESSION_LOG_RE.test(name), false, `${name} must not be a canonical slot`)
+  }
+})
+
+test('B5: canonical generation parsing matches the OFFICIAL parseSessionFormatLogFilename', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
+  const req = createRequire(join(rc4Dir, 'noop.js'))
+  const fmt = await import(pathToFileURL(req.resolve('@deepseek-ai/dsh-session-format')).href)
+  // The JSONL backend strips the configured compression suffix and then applies
+  // the format package's own basename rule (parseGenerationLogFilename).
+  for (const name of [...CANONICAL_CASES.map(([n]) => n), ...NON_CANONICAL_NAMES]) {
+    const base = name.endsWith('.zstd') ? name.slice(0, -'.zstd'.length) : name
+    const official = fmt.parseSessionFormatLogFilename(base)
+    assert.equal(canonicalGeneration(name), official === undefined ? -1 : official, name)
+  }
+})
+
+test('B5: a non-canonical leftover cannot manufacture ambiguity; the canonical session still restores and the leftover is reported', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
+  await injectLoader()
+  const unmount = await mountLocation()
+  const dir = mkdtempSync(join(tmpdir(), 'b5-leftover-'))
+  try {
+    const v0 = Buffer.from(JSON.stringify({ type: 'session', version: 0, id: 's-v0', createdAt: 1, cwd: '/w', delegationDepth: 0 }) + '\n')
+    const gz = buildV5Archive([
+      // canonical v0 slot
+      fileEntry('sessions', `${officialDirFor('s-v0')}/session.jsonl`, v0, 'sessions'),
+      // stale leftover with the non-canonical .v0 tag: the official backend
+      // ignores it, so it must neither create ambiguity nor be imported.
+      fileEntry('sessions', `${officialDirFor('s-v0')}/session.v0.jsonl`, v0, 'sessions'),
+    ])
+    const backup = join(dir, 'b.gz')
+    writeFileSync(backup, gz)
+    const r = await inspectSessions(backup, { stagingRoot: join(dir, 'staging') })
+    assert.deepEqual(r.ambiguous, [], 'a non-canonical name is not a second candidate')
+    assert.equal(r.counts.total, 1)
+    assert.equal(r.sessions[0].status, 'restored')
+    assert.equal(r.sessions[0].sourceGeneration, 0)
+    assert.equal(r.sessions[0].importable, true)
+    assert.deepEqual(r.nonCanonicalSessionSlots.map(s => s.fileName), ['session.v0.jsonl'])
+    // the leftover was verified by the reader but never staged/imported
+    assert.equal(r.stagingSummary.length, 1)
+    assert.equal(r.stagingSummary[0].path, `${officialDirFor('s-v0')}/session.jsonl`)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+    await unmount()
+  }
+})
+
+test('B5: a directory carrying only non-canonical session-log names is reported and counted, never silently dropped', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'b5-only-'))
+  try {
+    const gz = buildV5Archive([
+      fileEntry('sessions', `${officialDirFor('s-stale')}/session.v0.jsonl`, Buffer.from('{"type":"session","version":0}\n'), 'sessions'),
+      fileEntry('sessions', `${officialDirFor('s-stale')}/Session.v4.jsonl`, Buffer.from('{"x":1}\n'), 'sessions'),
+    ])
+    const backup = join(dir, 'b.gz')
+    writeFileSync(backup, gz)
+    const r = await inspectSessions(backup, { stagingRoot: join(dir, 'staging') })
+    assert.equal(r.sessions.length, 1, 'the isolated directory must have a report row')
+    const row = r.sessions[0]
+    assert.equal(row.status, 'refused')
+    assert.equal(row.code, 'LEGACY_NONCANONICAL_SESSION_NAME')
+    assert.equal(row.reason, 'noncanonical-session-name')
+    assert.equal(row.directory, officialDirFor('s-stale'))
+    assert.equal(row.sourceGeneration, null)
+    assert.deepEqual([...row.nonCanonicalFiles].sort(), ['Session.v4.jsonl', 'session.v0.jsonl'])
+    assert.equal(r.counts.total, 1)
+    assert.equal(r.counts.refused, 1)
+    assert.equal(r.counts.importable, 0)
+    assert.equal(r.counts.isolated, 1)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('B2: a LINK/EXCLUDED/UNREADABLE highest generation blocks the directory — never a silent lower-generation import', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
+  await injectLoader()
+  const unmount = await mountLocation()
+  const codec = await v3codec()
+  const dir = mkdtempSync(join(tmpdir(), 'b2-link-'))
+  try {
+    const gz = buildV5Archive([
+      // highest slot is a LINK; a readable v3 sits below it
+      slotEntry('sessions', `${officialDirFor('link-sess')}/session.v4.jsonl`, 'LINK'),
+      fileEntry('sessions', `${officialDirFor('link-sess')}/session.v3.jsonl`, v3SessionBytes(codec, 'link-sess'), 'sessions'),
+      // highest slot is EXCLUDED; a readable v3 sits below it
+      slotEntry('sessions', `${officialDirFor('excl-sess')}/session.v4.jsonl`, 'EXCLUDED'),
+      fileEntry('sessions', `${officialDirFor('excl-sess')}/session.v3.jsonl`, v3SessionBytes(codec, 'excl-sess'), 'sessions'),
+      // highest slot is UNREADABLE; a readable v3 sits below it
+      slotEntry('sessions', `${officialDirFor('unread-sess')}/session.v4.jsonl`, 'UNREADABLE'),
+      fileEntry('sessions', `${officialDirFor('unread-sess')}/session.v3.jsonl`, v3SessionBytes(codec, 'unread-sess'), 'sessions'),
+      // control: a clean readable v4 must still restore
+      fileEntry('sessions', `${officialDirFor('ok-sess')}/session.v4.jsonl`, headerRow(4, 'ok-sess'), 'sessions'),
+    ], { manifest: { integrity: 'PARTIAL' } })
+    const backup = join(dir, 'b.gz')
+    writeFileSync(backup, gz)
+    const r = await inspectSessions(backup, { stagingRoot: join(dir, 'staging') })
+    const byId = new Map(r.sessions.map(s => [s.id, s]))
+    for (const [id, kind] of [['link-sess', 'LINK'], ['excl-sess', 'EXCLUDED'], ['unread-sess', 'UNREADABLE']]) {
+      const row = byId.get(id)
+      assert.equal(row.status, 'refused', `${id}: a ${kind} highest generation must not fall back`)
+      assert.equal(row.code, 'LEGACY_GENERATION_UNAVAILABLE')
+      assert.equal(row.reason, 'highest-generation-unavailable')
+      assert.equal(row.sourceGeneration, 4)
+      assert.deepEqual(row.lowerGenerationsPresent, ['session.v3.jsonl'], 'the lower generation stays a diagnostic, never a substitute')
+      assert.equal(row.directory, officialDirFor(id))
+      const dirInfo = r.unavailableDirs.find(u => u.relDir === officialDirFor(id))
+      assert.deepEqual(dirInfo.kinds, [kind])
+      assert.deepEqual(dirInfo.declaredFiles, ['session.v4.jsonl'])
+    }
+    assert.equal(byId.get('ok-sess').status, 'restored', 'the control session must restore')
+    assert.equal(r.counts.total, 4)
+    assert.equal(r.counts.importable, 1)
+    assert.equal(r.counts.refused, 3)
+    assert.equal(r.counts.isolated, 3, 'every isolated directory is counted, so the preview can never claim 0/0')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+    await unmount()
+  }
+})
+
+test('B4: same-generation multiple candidates become a counted refused row with a stable reason, not an invisible 0/0', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
+  await injectLoader()
+  const unmount = await mountLocation()
+  const dir = mkdtempSync(join(tmpdir(), 'b4-amb-'))
+  try {
+    const v4 = Buffer.from(JSON.stringify({ type: 'session', version: 4, id: 'amb-sess', createdAt: 1, cwd: '/w', isSeeded: false, delegationDepth: 0 }) + '\n')
+    const gz = buildV5Archive([
+      fileEntry('sessions', `${officialDirFor('amb-sess')}/session.v4.jsonl`, v4, 'sessions'),
+      fileEntry('sessions', `${officialDirFor('amb-sess')}/session.v4.jsonl.zstd`, zlib.zstdCompressSync(v4), 'sessions'),
+      fileEntry('sessions', `${officialDirFor('ok-sess')}/session.v4.jsonl`, headerRow(4, 'ok-sess'), 'sessions'),
+    ])
+    const backup = join(dir, 'b.gz')
+    writeFileSync(backup, gz)
+    const r = await inspectSessions(backup, { stagingRoot: join(dir, 'staging') })
+    const row = r.sessions.find(s => s.id === 'amb-sess')
+    assert.equal(row.status, 'refused')
+    assert.equal(row.code, 'LEGACY_GENERATION_AMBIGUOUS')
+    assert.equal(row.reason, 'ambiguous-generation')
+    assert.equal(row.sourceGeneration, 4)
+    assert.deepEqual([...row.candidates].sort(), ['session.v4.jsonl', 'session.v4.jsonl.zstd'])
+    assert.deepEqual(r.ambiguous.map(a => a.relDir), [officialDirFor('amb-sess')])
+    assert.equal(r.counts.total, 2, 'the isolated directory counts as a session row')
+    assert.equal(r.counts.importable, 1)
+    assert.equal(r.counts.refused, 1)
+    assert.equal(r.counts.isolated, 1)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+    await unmount()
+  }
+})
+
+test('B1: an ambiguous direct-child directory cannot close the parent — the parent is isolated', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
+  await injectLoader()
+  const unmount = await mountLocation()
+  const codec = await v3codec()
+  const dir = mkdtempSync(join(tmpdir(), 'b1-amb-'))
+  try {
+    const childBytes = v3SessionBytes(codec, 'child-amb', { origin: 'subagent', parentSession: 'parent-amb', descriptor: { provider: 'p', version: 1, mode: 'continuable', label: 'l' } })
+    const gz = buildV5Archive([
+      fileEntry('sessions', `${officialDirFor('parent-amb')}/session.v3.jsonl`, v3SessionBytes(codec, 'parent-amb'), 'sessions'),
+      fileEntry('sessions', `${officialDirFor('child-amb')}/session.v3.jsonl`, childBytes, 'sessions'),
+      fileEntry('sessions', `${officialDirFor('child-amb')}/session.v3.jsonl.zstd`, zlib.zstdCompressSync(childBytes), 'sessions'),
+    ])
+    const backup = join(dir, 'b.gz')
+    writeFileSync(backup, gz)
+    const r = await inspectSessions(backup, { stagingRoot: join(dir, 'staging') })
+    const parent = r.sessions.find(s => s.id === 'parent-amb')
+    assert.equal(parent.status, 'refused')
+    assert.equal(parent.code, 'LEGACY_CHILD_EVIDENCE_INCOMPLETE')
+    assert.equal(parent.reason, 'child-evidence-incomplete')
+    assert.equal(r.sessions.find(s => s.id === 'child-amb').code, 'LEGACY_GENERATION_AMBIGUOUS')
+    assert.equal(r.childEvidence.complete, false)
+    assert.deepEqual(r.childEvidence.unattributed.map(s => s.directory), [officialDirFor('child-amb')])
+    assert.equal(r.counts.importable, 0)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+    await unmount()
+  }
+})
+
+test('B1: a DUPLICATED direct child yields an unavailable fact instead of vanishing from the parent catalog', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
+  await injectLoader()
+  const unmount = await mountLocation()
+  const codec = await v3codec()
+  const dir = mkdtempSync(join(tmpdir(), 'b1-dup-'))
+  try {
+    const gz = buildV5Archive([
+      fileEntry('sessions', `${officialDirFor('p-dup')}/session.v3.jsonl`, v3SessionBytes(codec, 'p-dup'), 'sessions'),
+      // the SAME child id from two official locations (cwd '/w' and '/other')
+      fileEntry('sessions', `${officialDirFor('child-dup')}/session.v3.jsonl`,
+        v3SessionBytes(codec, 'child-dup', { origin: 'subagent', parentSession: 'p-dup', descriptor: { provider: 'p', version: 1, mode: 'continuable', label: 'l' } }), 'sessions'),
+      fileEntry('sessions', `--other--/child-dup/session.v3.jsonl`,
+        v3SessionBytes(codec, 'child-dup', { origin: 'subagent', parentSession: 'p-dup', cwd: '/other', descriptor: { provider: 'p', version: 1, mode: 'continuable', label: 'l' } }), 'sessions'),
+    ])
+    const backup = join(dir, 'b.gz')
+    writeFileSync(backup, gz)
+    const r = await inspectSessions(backup, { stagingRoot: join(dir, 'staging') })
+    const parent = r.sessions.find(s => s.id === 'p-dup')
+    const childRows = r.sessions.filter(s => s.code === 'LEGACY_DUPLICATE_SESSION_ID')
+    assert.equal(childRows.length, 2, 'both duplicate copies are isolated')
+    // The isolated child's identity is still VERIFIED, so the parent keeps the
+    // declared child as an explicit empty-descriptor fact.
+    assert.deepEqual(r.childEvidence.declared.filter(d => d.parent === 'p-dup').map(d => ({ child: d.child, mode: d.mode })),
+      [{ child: 'child-dup', mode: 'unavailable-fact' }])
+    assert.equal(parent.status, 'restored')
+    assert.equal(parent.importable, true)
+    assert.equal(parent.canonicalEvents, 3, '2 own events + the completed child catalog row')
+    assert.equal(parent.childEvidence.unavailable, 1)
+    assert.deepEqual(parent.childEvidence.unavailableChildren, [{ child: 'child-dup', code: 'LEGACY_DUPLICATE_SESSION_ID' }])
+    assert.equal(r.counts.total, 3)
+    assert.equal(r.counts.importable, 1)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+    await unmount()
+  }
+})
+
+test('B1: the catalog-preservation invariant refuses an artifact that lost a declared subagent/catalog event', async () => {
+  assert.deepEqual(assertChildCatalogPreserved([], { events: [] }), { declared: 0, restored: 0 })
+  assert.deepEqual(assertChildCatalogPreserved([{ type: 'subagent/catalog' }], { events: [{ type: 'subagent/catalog' }] }), { declared: 1, restored: 1 })
+  // binding child facts may ADD catalog events — that is not a loss
+  assert.deepEqual(
+    assertChildCatalogPreserved([{ type: 'subagent/catalog' }], { events: [{ type: 'subagent/catalog' }, { type: 'subagent/catalog' }] }),
+    { declared: 1, restored: 2 },
+  )
+  assert.throws(
+    () => assertChildCatalogPreserved([{ type: 'turn/start' }, { type: 'subagent/catalog' }], { events: [{ type: 'turn/start' }] }),
+    error => error.code === 'LEGACY_CHILD_EVIDENCE_INCOMPLETE' && error.declared === 1 && error.restored === 0,
+  )
+})
+
+test('P1 dependency group: an isolated historical parent withholds its v4 child and grandchild; an unrelated verified group stays importable', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
+  await injectLoader()
+  const unmount = await mountLocation()
+  const codec = await v3codec()
+  const { inspectSessionsInternal } = await import('../lib/inspect-sessions.js')
+  const dir = mkdtempSync(join(tmpdir(), 'dep-group-'))
+  try {
+    const gz = buildV5Archive([
+      // historical parent whose direct-child evidence cannot be closed (ghost)
+      fileEntry('sessions', `${officialDirFor('grp-p')}/session.v3.jsonl`, v3SessionBytes(codec, 'grp-p'), 'sessions'),
+      // its v4 child and v4 grandchild: current generation, so they would have
+      // been imported standalone under the old behavior
+      fileEntry('sessions', `${officialDirFor('grp-c')}/session.v4.jsonl`, await v4SessionBytes('grp-c', { parentSession: 'grp-p' }), 'sessions'),
+      fileEntry('sessions', `${officialDirFor('grp-g')}/session.v4.jsonl`, await v4SessionBytes('grp-g', { parentSession: 'grp-c' }), 'sessions'),
+      // unrelated, fully verifiable group: must NOT be collateral damage
+      fileEntry('sessions', `${officialDirFor('ok-p')}/session.v4.jsonl`, await v4SessionBytes('ok-p'), 'sessions'),
+      fileEntry('sessions', `${officialDirFor('ok-c')}/session.v4.jsonl`, await v4SessionBytes('ok-c', { parentSession: 'ok-p' }), 'sessions'),
+      // declared-missing slot → the archive's child-evidence scan is incomplete
+      missingEntry('sessions', `${officialDirFor('ghost')}/session.v3.jsonl`, 'sessions'),
+    ], { manifest: { integrity: 'PARTIAL' } })
+    const backup = join(dir, 'b.gz')
+    writeFileSync(backup, gz)
+    const { report, artifacts, staging } = await inspectSessionsInternal(backup, { stagingRoot: join(dir, 'staging') })
+    await staging.cleanupAll()
+    const byId = new Map(report.sessions.map(s => [s.id, s]))
+    assert.equal(byId.get('grp-p').code, 'LEGACY_CHILD_EVIDENCE_INCOMPLETE', 'the parent itself is isolated by the child-evidence gate')
+    const child = byId.get('grp-c')
+    assert.equal(child.status, 'refused', 'a v4 child must not import without its isolated parent')
+    assert.equal(child.importable, false)
+    assert.equal(child.code, 'LEGACY_CHILD_EVIDENCE_INCOMPLETE')
+    assert.equal(child.reason, 'parent-isolated')
+    assert.deepEqual(child.parentIsolation, { parent: 'grp-p', cause: 'isolated-parent' })
+    const grandchild = byId.get('grp-g')
+    assert.equal(grandchild.status, 'refused', 'the chain is closed transitively')
+    assert.equal(grandchild.reason, 'parent-isolated')
+    assert.deepEqual(grandchild.parentIsolation, { parent: 'grp-c', cause: 'isolated-parent' })
+    // unrelated verified group untouched
+    assert.equal(byId.get('ok-p').importable, true)
+    assert.equal(byId.get('ok-c').importable, true)
+    // no PRIVATE artifact survives for a withheld session
+    assert.deepEqual(artifacts.map(a => a.id).sort(), ['ok-c', 'ok-p'])
+    // counts: withheld sessions count as refused + isolated, never as importable
+    assert.deepEqual(report.counts, { total: 6, importable: 2, refused: 4, failed: 0, isolated: 3 })
+    assert.deepEqual(report.dependencyIsolation.map(d => ({ child: d.child, parent: d.parent, cause: d.cause })).sort((a, b) => a.child.localeCompare(b.child)), [
+      { child: 'grp-c', parent: 'grp-p', cause: 'isolated-parent' },
+      { child: 'grp-g', parent: 'grp-c', cause: 'isolated-parent' },
+    ])
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+    await unmount()
+  }
+})
+
+test('P1 dependency group: a parent refused for a restore failure withholds its readable child; a healthy parent/child pair is untouched', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
+  await injectLoader()
+  const unmount = await mountLocation()
+  const codec = await v3codec()
+  const dir = mkdtempSync(join(tmpdir(), 'dep-bad-'))
+  try {
+    // parent identity verifies (salvage header) but its rows cannot be restored
+    const corruptParent = Buffer.concat([
+      Buffer.from(JSON.stringify(codec.encodeHeader({ version: 3, id: 'bad-p', createdAt: 1793500000000, cwd: '/w', isSeeded: false, delegationDepth: 0 }, 0)) + '\n'),
+      Buffer.from('{"type":"turn/start" BROKEN\n'),
+    ])
+    const descriptor = { provider: 'p', version: 1, mode: 'continuable', label: 'l' }
+    const gz = buildV5Archive([
+      fileEntry('sessions', `${officialDirFor('bad-p')}/session.v3.jsonl`, corruptParent, 'sessions'),
+      fileEntry('sessions', `${officialDirFor('bad-c')}/session.v3.jsonl`, v3SessionBytes(codec, 'bad-c', { origin: 'subagent', parentSession: 'bad-p', descriptor }), 'sessions'),
+      fileEntry('sessions', `${officialDirFor('ok-p')}/session.v3.jsonl`, v3SessionBytes(codec, 'ok-p'), 'sessions'),
+      fileEntry('sessions', `${officialDirFor('ok-c')}/session.v3.jsonl`, v3SessionBytes(codec, 'ok-c', { origin: 'subagent', parentSession: 'ok-p', descriptor }), 'sessions'),
+    ])
+    const backup = join(dir, 'b.gz')
+    writeFileSync(backup, gz)
+    const r = await inspectSessions(backup, { stagingRoot: join(dir, 'staging') })
+    // a fully attributed archive: the child is withheld because of its PARENT,
+    // not because the scan is incomplete
+    assert.equal(r.childEvidence.complete, true)
+    const byId = new Map(r.sessions.map(s => [s.id, s]))
+    assert.equal(byId.get('bad-p').status, 'refused')
+    assert.equal(byId.get('bad-p').code, 'SESSION_ROW_MALFORMED')
+    const child = byId.get('bad-c')
+    assert.equal(child.status, 'refused')
+    assert.equal(child.reason, 'parent-isolated')
+    assert.equal(child.code, 'LEGACY_CHILD_EVIDENCE_INCOMPLETE')
+    assert.deepEqual(child.parentIsolation, { parent: 'bad-p', cause: 'isolated-parent' })
+    // healthy pair untouched
+    assert.equal(byId.get('ok-p').importable, true)
+    assert.equal(byId.get('ok-c').importable, true)
+    assert.equal(r.counts.total, 4)
+    assert.equal(r.counts.importable, 2)
+    assert.equal(r.counts.refused, 2)
+    assert.equal(r.counts.isolated, 1)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+    await unmount()
+  }
+})
+
+test('P1 dependency group: a genuine orphan stays importable; the same session is withheld when an unverifiable slot could be its parent', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
+  await injectLoader()
+  const unmount = await mountLocation()
+  const dir = mkdtempSync(join(tmpdir(), 'dep-orphan-'))
+  try {
+    // Clean archive: header.parentSession names a session that is simply not
+    // part of this archive → importable (reported through unmatchedFacts, the
+    // existing / no-silent-loss behavior; no over-isolation).
+    const cleanBackup = join(dir, 'clean.gz')
+    writeFileSync(cleanBackup, buildV5Archive([
+      fileEntry('sessions', `${officialDirFor('orphan-c')}/session.v4.jsonl`, await v4SessionBytes('orphan-c', { parentSession: 'absent-p' }), 'sessions'),
+    ]))
+    const clean = await inspectSessions(cleanBackup, { stagingRoot: join(dir, 'staging-clean') })
+    assert.equal(clean.childEvidence.complete, true)
+    assert.equal(clean.sessions.find(s => s.id === 'orphan-c').importable, true, 'a genuine orphan must not be withheld')
+    assert.ok(clean.childEvidence.unmatchedFacts.some(u => u.child === 'orphan-c' && u.parent === 'absent-p'))
+    // Incomplete archive: one declared-missing slot means that missing session
+    // COULD be the parent → the child cannot be proven orphaned, so it is
+    // conservatively withheld and the reason is reported.
+    const partialBackup = join(dir, 'partial.gz')
+    writeFileSync(partialBackup, buildV5Archive([
+      fileEntry('sessions', `${officialDirFor('orphan-c')}/session.v4.jsonl`, await v4SessionBytes('orphan-c', { parentSession: 'absent-p' }), 'sessions'),
+      missingEntry('sessions', `${officialDirFor('ghost')}/session.v3.jsonl`, 'sessions'),
+    ], { manifest: { integrity: 'PARTIAL' } }))
+    const partial = await inspectSessions(partialBackup, { stagingRoot: join(dir, 'staging-partial') })
+    assert.equal(partial.childEvidence.complete, false)
+    const orphan = partial.sessions.find(s => s.id === 'orphan-c')
+    assert.equal(orphan.status, 'refused')
+    assert.equal(orphan.reason, 'parent-isolated')
+    assert.deepEqual(orphan.parentIsolation, { parent: 'absent-p', cause: 'unresolved-parent' })
+    assert.equal(partial.counts.importable, 0)
+    assert.equal(partial.counts.isolated, 2)
+    assert.deepEqual(partial.dependencyIsolation.map(d => d.cause), ['unresolved-parent'])
   } finally {
     rmSync(dir, { recursive: true, force: true })
     await unmount()

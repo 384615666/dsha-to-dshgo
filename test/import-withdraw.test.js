@@ -295,3 +295,61 @@ test('P2 F1: an escaping locate result and the sessions root itself are refused 
     rmSync(jobDir, { recursive: true, force: true })
   }
 })
+
+test('P3.2 no-cwd: a session created WITHOUT cwd is withdrawn through the measured _no-cwd projection; every other shape is refused', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
+  const t = await mountTarget()
+  const jobDir = mkdtempSync(join(tmpdir(), 'p32-nocwd-'))
+  try {
+    // A session with NO cwd at all: the engine stores it under <root>/_no-cwd.
+    const header = { version: 4, id: 'no-cwd-s', createdAt: 1793500000000, isSeeded: false, delegationDepth: 0, agentPreset: 'standard' }
+    const handle = await t.persistence.create(header, { inheritedEventCount: 0 })
+    await handle.append([{ type: 'turn/start', seq: 0, time: 1, data: { turn: 1 } }])
+    await handle.flush()
+    const revision = (await t.persistence.stat('no-cwd-s')).revision
+    await handle.close()
+    const quarantineRoot = join(jobDir, 'quarantine')
+    const adapter = createJsonlWithdrawalAdapter({
+      persistence: t.persistence,
+      sessionsRoot: t.sessionsRoot,
+      locateDir: h => t.locateDir(h),
+      quarantineRoot,
+    })
+
+    // 1) an absent cwd is NOT silently treated as a cwd
+    await assert.rejects(
+      () => adapter('no-cwd-s', { expectedRevision: revision }),
+      err => err.code === 'WITHDRAW_NOT_SAFE',
+    )
+    assert.ok(await t.persistence.stat('no-cwd-s'), 'refusal never moves the session')
+    // 2) a no-cwd request that contradicts a recorded cwd is refused
+    await assert.rejects(
+      () => adapter('no-cwd-s', { expectedRevision: revision, cwd: t.base, cwdMode: 'no-cwd' }),
+      err => err.code === 'WITHDRAW_NOT_SAFE',
+    )
+    // 3) a projection that is NOT the measured _no-cwd/<session> layout is refused
+    const wrongProjection = createJsonlWithdrawalAdapter({
+      persistence: t.persistence,
+      sessionsRoot: t.sessionsRoot,
+      locateDir: () => 'some-project/other-segment',
+      quarantineRoot,
+    })
+    await assert.rejects(
+      () => wrongProjection('no-cwd-s', { expectedRevision: revision, cwdMode: 'no-cwd' }),
+      err => err.code === 'WITHDRAW_NOT_SAFE',
+    )
+    assert.ok(await t.persistence.stat('no-cwd-s'), 'a wrong projection never moves anything')
+    // 4) the measured projection withdraws safely and keeps the payload
+    const result = await adapter('no-cwd-s', { expectedRevision: revision, cwdMode: 'no-cwd' })
+    assert.equal(result.cwdMode, 'no-cwd')
+    assert.equal(result.quarantinedTo, join(quarantineRoot, quarantineNameFor('no-cwd-s')))
+    assert.ok(existsSync(result.quarantinedTo), 'the payload is kept recoverable')
+    assert.equal(await t.persistence.stat('no-cwd-s'), undefined, 'the session left the active namespace')
+    const owner = JSON.parse(readFileSync(join(quarantineRoot, `${quarantineNameFor('no-cwd-s')}.owner.json`), 'utf8'))
+    assert.equal(owner.cwd, null)
+    assert.equal(owner.cwdMode, 'no-cwd')
+    assert.equal(owner.sourceId, 'no-cwd-s')
+  } finally {
+    await t.unmount()
+    rmSync(jobDir, { recursive: true, force: true })
+  }
+})

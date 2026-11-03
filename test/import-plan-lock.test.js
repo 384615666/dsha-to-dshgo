@@ -386,3 +386,36 @@ test('P2 lock: a reclaimer waiting behind the guard never re-targets a NEW gener
     rmSync(dir, { recursive: true, force: true })
   }
 })
+
+test('P3.2 lock: peekGuard/clearStaleGuard only reclaim an abandoned old guard', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsha-lock-guard-'))
+  try {
+    const { peekGuard, clearStaleGuard } = await import('../lib/import/lock.js')
+    const guard = join(dir, 'import-job.lock.guard')
+    mkdirSync(guard, { recursive: true })
+    let snap = peekGuard(dir)
+    assert.equal(snap.held, true)
+    assert.ok(Number.isFinite(snap.ageMs))
+    assert.throws(() => clearStaleGuard(dir, { olderThanMs: 30_000 }), err => err.code === 'IMPORT_LOCK_BUSY')
+    const { utimesSync } = await import('node:fs')
+    const old = new Date(Date.now() - 60_000)
+    utimesSync(guard, old, old)
+    const cleared = clearStaleGuard(dir, { olderThanMs: 30_000 })
+    assert.equal(cleared.cleared, true)
+    assert.equal(peekGuard(dir).held, false)
+    assert.deepEqual(clearStaleGuard(dir, { olderThanMs: 30_000 }), { cleared: false, reason: 'no-guard' })
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('P3.2 controller: lock inspection/release API exists for the recovery panel', async () => {
+  const { createMigrationController } = await import('../lib/import/controller.js')
+  const controller = createMigrationController()
+  assert.equal(typeof controller.inspectLock, 'function')
+  assert.equal(typeof controller.unlockAndResume, 'function')
+  assert.equal(typeof controller.purgePrivateData, 'function')
+  const snap = controller.inspectLock()
+  assert.equal(typeof snap, 'object')
+  assert.equal(typeof snap.held, 'boolean')
+})

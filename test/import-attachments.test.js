@@ -9,6 +9,7 @@ import { createHash } from 'node:crypto'
 import { createRequire } from 'node:module'
 import { pathToFileURL } from 'node:url'
 import { collectAttachmentDependencies, planAttachmentPublication, publishAttachments, validateAttachmentRef } from '../lib/import/attachments.js'
+import { ImportJournal } from '../lib/import/journal.js'
 import { isStageableAttachmentPath, AttachmentStaging } from '../lib/archive/attachment-staging.js'
 
 const rc4Dir = process.env.RC4_MODULES
@@ -129,10 +130,11 @@ test('P2 M2 publish: normalized images are copied byte-for-byte (no re-encode); 
     const filePublished = result.published.find(x => x.kind === 'file')
     assert.ok(filePublished, 'the file is the newly created object')
     // The store's verbatim commit IS creation evidence only when the probe
-    // confirmed the object absent; without host-path knowledge the module
-    // conservatively reports non-owned (never withdrawn on unknown).
-    assert.ok(filePublished.owned === true || filePublished.ownership === 'unknown',
-      `honest ownership: ${JSON.stringify(filePublished)}`)
+    // confirmed the object absent; without a proven-exclusive creation the
+    // module reports 'created-unverified' (compensable after content +
+    // reference checks) and never claims ownership.
+    assert.equal(filePublished.owned, false)
+    assert.equal(filePublished.ownership, 'created-unverified', `honest ownership: ${JSON.stringify(filePublished)}`)
     assert.equal(filePublished.attachmentId, `sha256:${sha(fileBytes)}`)
     // the reused image is honestly reported NOT owned (existed before this batch)
     const imageReused = result.reused.find(x => x.kind === 'image')
@@ -232,6 +234,94 @@ test('P2 M2 publish: source digest/length mismatches and an fsync failure refuse
       err => err?.name === 'AbortError' || /aborted/i.test(String(err?.message)),
     )
   } finally {
+    await t.unmount()
+  }
+})
+
+test('P3.2 intent discipline: EVERY publication failure/cancellation closes the intent with evidence (never a dangling intent)', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
+  const t = await mountStore()
+  const journalDir = mkdtempSync(join(tmpdir(), 'p32-intent-'))
+  try {
+    const journal = ImportJournal.init(join(journalDir, 'journal.json'), { instanceFingerprint: 'inst-p32', sourceDigest: 'src-p32' })
+    const fileBytes = Buffer.from('intent discipline\n')
+    const fileRef = { attachmentId: `sha256:${sha(fileBytes)}`, name: 'discipline.txt', bytes: fileBytes.length }
+    const object = {
+      key: `file:${sha(fileBytes)}:discipline.txt`,
+      kind: 'file',
+      digest: sha(fileBytes),
+      ref: fileRef,
+      usedBy: ['s1'],
+      bytes: fileBytes,
+      needsPublish: true,
+      reused: false,
+    }
+    const openIntents = () => journal.state.actions.filter(a => a.stage === 'intent')
+
+    // 1) failure BEFORE the store call (no verbatim API): 'rejected', nothing stored
+    const noPublishApi = { fileHostPath: () => null, readFileStream: async function* () {} }
+    await assert.rejects(
+      () => publishAttachments({ store: noPublishApi, attachmentRoot: t.root, planned: [object], journal }),
+      err => err.code === 'ATTACHMENT_UNSUPPORTED',
+    )
+    assert.equal(openIntents().length, 0, 'a pre-store failure must not leave an open intent')
+    let action = journal.state.actions.at(-1)
+    assert.equal(action.stage, 'done')
+    assert.equal(action.outcome.ownership, 'rejected', 'nothing could have been written')
+    assert.equal(action.outcome.publication, 'failed')
+    assert.equal(action.outcome.reason, 'ATTACHMENT_UNSUPPORTED')
+    assert.equal(action.outcome.ref.name, 'discipline.txt', 'the durable ref is recorded as compensation evidence')
+    assert.ok(!JSON.stringify(action.outcome).includes('intent discipline'), 'no raw source text in the journal outcome')
+
+    // 2) failure INSIDE the store call: 'unknown' (the object may exist)
+    const failingStore = {
+      saveFileStream: async () => { const e = new Error('injected ENOSPC at /private/path'); e.code = 'ENOSPC'; throw e },
+      fileHostPath: () => null,
+    }
+    await assert.rejects(
+      () => publishAttachments({ store: failingStore, attachmentRoot: t.root, planned: [object], journal }),
+      err => err.code === 'ENOSPC',
+    )
+    assert.equal(openIntents().length, 0, 'a mid-publication failure must not leave an open intent')
+    action = journal.state.actions.at(-1)
+    assert.equal(action.stage, 'done')
+    assert.equal(action.outcome.ownership, 'unknown', 'a started store call may have written the object')
+    assert.equal(action.outcome.reason, 'ENOSPC')
+    assert.ok(!JSON.stringify(action.outcome).includes('/private/path'), 'error text never enters the outcome')
+
+    // 3) cancellation AFTER the object was published and verified: the intent
+    // is closed WITH ownership + host path, so compensation can judge it.
+    const controller = new AbortController()
+    const realSave = t.store.saveFileStream.bind(t.store)
+    const abortingStore = new Proxy(t.store, {
+      get(target, prop) {
+        if (prop === 'saveFileStream') {
+          return async input => {
+            const ref = await realSave(input)
+            controller.abort()
+            return ref
+          }
+        }
+        const value = target[prop]
+        return typeof value === 'function' ? value.bind(target) : value
+      },
+    })
+    await assert.rejects(
+      () => publishAttachments({ store: abortingStore, attachmentRoot: t.root, planned: [object], journal, signal: controller.signal }),
+      err => err?.name === 'AbortError' || /aborted/i.test(String(err?.message)),
+    )
+    assert.equal(openIntents().length, 0, 'a cancellation after publication must not leave an open intent')
+    action = journal.state.actions.at(-1)
+    assert.equal(action.stage, 'done')
+    assert.equal(action.outcome.ownership, 'created-unverified', 'ownership evidence survives the abort')
+    assert.equal(action.outcome.aborted, true)
+    assert.ok(action.outcome.hostPath, 'the host path is recorded for compensation')
+    assert.ok(existsSync(action.outcome.hostPath), 'the published object really exists')
+    // and the official reader returns exactly those bytes
+    const chunks = []
+    for await (const chunk of t.store.readFileStream(action.outcome.ref)) chunks.push(Buffer.from(chunk))
+    assert.deepEqual(Buffer.concat(chunks), fileBytes)
+  } finally {
+    rmSync(journalDir, { recursive: true, force: true })
     await t.unmount()
   }
 })
