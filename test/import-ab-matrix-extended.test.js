@@ -64,15 +64,16 @@ async function buildCandidate(kind, id, cwd) {
   const req = createRequire(join(rc4Dir, 'noop.js'))
   const v23 = await import(pathToFileURL(req.resolve('@deepseek-ai/dsh-session-format-v2-to-v3')).href)
   const codec = v23.releasedV3SessionFormatCodec
-  if (kind === 'v1' || kind === 'v2') {
+  if (kind === 'v0' || kind === 'v1' || kind === 'v2') {
     // Historical generations through the SAME official chain. v2 has the
-    // released encoder; v1 is decode-only, so its released physical rows are
-    // written directly (the packed text-chunks row expands to two events,
-    // exercising the v1 restorer's emitEvent contract).
+    // released encoder; v0/v1 are decode-only, so their shared released
+    // physical layout is written directly (the packed text-chunks row expands
+    // to two events, exercising the v0/v1 restorer's emitEvent contract).
     let physicalHeader
     let physicalRows
-    if (kind === 'v1') {
-      physicalHeader = { type: 'session', version: 1, id, createdAt: 1793500000000, cwd, delegationDepth: 0 }
+    if (kind === 'v0' || kind === 'v1') {
+      const version = kind === 'v0' ? 0 : 1
+      physicalHeader = { type: 'session', version, id, createdAt: 1793500000000, cwd, delegationDepth: 0 }
       physicalRows = [
         e('turn/start', 0, { turn: 1 }),
         e('step/start', 1, { turn: 1, step: 1 }),
@@ -93,6 +94,10 @@ async function buildCandidate(kind, id, cwd) {
       ].map(ev => codec2.encodeEvent(ev))
     }
     const out = await chain.migrateToV4(physicalHeader, physicalRows, { childFacts: [] })
+    assert.equal(out.sourceVersion, kind === 'v0' ? 0 : kind === 'v1' ? 1 : 2)
+    if (kind === 'v0' || kind === 'v1') {
+      assert.equal(out.eventRows.length, 6, 'the packed v0/v1 row must expand to six logical events')
+    }
     const cat = (await import(pathToFileURL(req.resolve('@deepseek-ai/dsh-session-format-catalog')).href)).sessionFormatCatalog
     const restore = cat.createRestore(out.headerRow, { recovery: 'strict', validation: 'current' })
     for (const row of out.eventRows) restore.decodeRow(row)
@@ -200,9 +205,9 @@ const APPEND = (id, startSeq, turn) => [
   { type: 'turn/end', seq: startSeq + 2, time: 9_002, data: { turn, reason: { kind: 'completed' } } },
 ]
 
-const MATRIX_CASES = ['plain', 'compaction', 'seeded', 'preset-preserved', 'empty', 'v1', 'v2']
+const MATRIX_CASES = ['plain', 'compaction', 'seeded', 'preset-preserved', 'empty', 'v0', 'v1', 'v2']
 
-test('P2 M4 extended A/B matrix: plain/compaction/seeded/preset-preserved/empty/v1/v2 satisfy the same gates on both paths', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
+test('P2 M4 extended A/B matrix: plain/compaction/seeded/preset-preserved/empty/v0/v1/v2 satisfy the same gates on both paths', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
   const matrix = []
   for (const kind of MATRIX_CASES) {
     const a = await mountTarget()
