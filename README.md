@@ -27,7 +27,7 @@
 
 验证基线：`208` 项自动化测试（隔离 rc.4 引擎与真实备份夹具；三组环境分别运行）；SDK 清单/半宿主加载/中英文面板通过；npm 包门禁通过。旧代（v0–v3）只有合成夹具证据，**未在真实用户旧数据上验证**。
 
-**尚未完成/未放行**：真机真实续聊已在可用的 `Glm 5.3 Flash` 通道通过（空会话对照、导入会话首发与重启后各一次）；导入会话原 `Flash` 通道因缺少 DeepSeek API Key 仍未通过。B 路径仍是实验入口，未接入统一作业；npm 发布与市场真实安装未执行。真机原生列表、工作区筛选、标题、重启和重开历史已在 Redmi 上通过。当前版本不要作为唯一数据副本使用。
+**发行说明**：npm 包名为 `dsha-to-dshgo`；官方市场索引可能延迟，若市场暂未出现，请先以 npm 包安装。真机真实续聊已在可用的 `Glm 5.3 Flash` 通道通过（空会话对照、导入会话首发与重启后各一次）；导入会话原 `Flash` 通道因缺少 DeepSeek API Key 仍未通过。B 路径仍是实验入口，未接入统一作业。真机原生列表、工作区筛选、标题、重启和重开历史已在 Redmi 上通过。当前版本不要作为唯一数据副本使用。
 
 ### 开发期安装（dsh-Go，无需 Root）
 
@@ -94,7 +94,7 @@ Implemented and verified against an isolated rc.4 engine with a real backup:
 
 Baseline: `208` automated tests across three environments; SDK manifest/half-host load/zh-en panels pass; the npm package gate passes. Historical generations (v0–v3) have synthetic fixtures only — **not validated against real user legacy data**.
 
-**Not released yet**: real continuation passed on the available `Glm 5.3 Flash` channel (an empty control, plus the imported session before and after restart); the imported session's original `Flash` channel still fails without a DeepSeek API key. B path remains an experimental entry and is not wired into the job; npm publishing and market installation are not done. Native list, workspace filter, titles, restart and history reopening pass on the Redmi. Do not use this version as the only copy of your data.
+**Release note**: the npm package is `dsha-to-dshgo`; official market indexing may lag—install from npm if the market has not refreshed yet. Real continuation passed on the available `Glm 5.3 Flash` channel (an empty control, plus the imported session before and after restart); the imported session's original `Flash` channel still fails without a DeepSeek API key. B path remains an experimental entry and is not wired into the job. Native list, workspace filter, titles, restart and history reopening pass on the Redmi. Do not use this version as the only copy of your data.
 
 ### Development install (no root)
 

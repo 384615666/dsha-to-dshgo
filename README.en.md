@@ -21,7 +21,7 @@ Implemented and verified against an isolated rc.4 engine with a real backup:
 
 Baseline: 208 automated tests with the isolated engine and real fixtures; SDK manifest/half-host load/zh-en panels pass; the npm package gate passes. Historical generations (v0–v3) have synthetic fixtures only — **not validated against real user legacy data**.
 
-**Not released yet**: real continuation passed on the available `Glm 5.3 Flash` channel; the imported session's original `Flash` channel still needs a DeepSeek API key. npm publishing and market installation are not done. Do not use this version as the only copy of your data.
+**Release note**: the npm package is `dsha-to-dshgo`; official market indexing may lag—install from npm if the market has not refreshed yet. Real continuation passed on the available `Glm 5.3 Flash` channel; the imported session's original `Flash` channel still needs a DeepSeek API key. Do not use this version as the only copy of your data.
 
 ## Development install (no root)
 
