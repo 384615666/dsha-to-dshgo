@@ -712,3 +712,23 @@ test('P2 R5: a second workspace membership for one session is refused before att
   assert.doesNotThrow(() => assertNoDuplicateWorkspaceMembership(registry, 'ws-a', 's1'))
   assert.doesNotThrow(() => assertNoDuplicateWorkspaceMembership(registry, 'ws-b', 's2'))
 })
+
+test('P2 R5: a HIDDEN persisted member (visible getter empty) is still refused', () => {
+  const registry = { list: () => [{ id: 'ws-a', sessionIds: [] }] }
+  const snapshot = {
+    workspaces: [
+      { id: 'ws-a', path: '/old', sessionIds: [], persistedSessionIds: ['s-hidden'] },
+      { id: 'ws-b', path: '/new', sessionIds: [], persistedSessionIds: [] },
+    ],
+  }
+  assert.throws(
+    () => assertNoDuplicateWorkspaceMembership(registry, 'ws-b', 's-hidden', snapshot),
+    err => err.code === 'IMPORT_WORKSPACE_DUPLICATE' && err.layer === 'persisted')
+  // Same workspace is not a duplicate; unrelated session is fine.
+  assert.doesNotThrow(() => assertNoDuplicateWorkspaceMembership(registry, 'ws-a', 's-hidden', snapshot))
+  assert.doesNotThrow(() => assertNoDuplicateWorkspaceMembership(registry, 'ws-b', 's-other', snapshot))
+  // A new target workspace (no id) cannot absorb any persisted member.
+  assert.throws(
+    () => assertNoDuplicateWorkspaceMembership(registry, null, 's-hidden', snapshot),
+    err => err.code === 'IMPORT_WORKSPACE_DUPLICATE')
+})
