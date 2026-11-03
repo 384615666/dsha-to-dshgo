@@ -259,3 +259,25 @@ test('repair CLI: the real --apply path succeeds with the durable protocol and r
     rmSync(dir, { recursive: true, force: true })
   }
 })
+
+test('repair write: a backup directory fsync EIO aborts before the unit is replaced', () => {
+  const { dir, unitPath, original, diff } = setup()
+  try {
+    const fsOps = proxyFs({
+      onFsync: (path, fd) => {
+        if (path === dir) {
+          const error = new Error('injected EIO')
+          error.code = 'EIO'
+          throw error
+        }
+        return fs.fsyncSync(fd)
+      },
+    })
+    assert.throws(
+      () => applyWorkspaceRepairFile({ unitPath, unitBytes: original, diff, expectSha256: diff.unitSha256, engineStopped: true, fsOps }),
+      error => error.code === 'REPAIR_FSYNC_FAILED')
+    assert.deepEqual(readFileSync(unitPath), original)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
