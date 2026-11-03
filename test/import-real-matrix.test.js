@@ -635,3 +635,27 @@ process.exit(0)
     rmSync(dir, { recursive: true, force: true })
   }
 })
+
+test('P2 M4 B filesystem capability: a hard-link refusal is B_UNSUPPORTED with no visible session', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
+  const b = await mountTarget()
+  const origLink = fs.linkSync
+  try {
+    const { candidate, bytes } = await syntheticCandidate('m4-b-nolink', b.base)
+    fs.linkSync = () => {
+      const error = new Error('hard links unsupported on this filesystem')
+      error.code = 'EPERM'
+      throw error
+    }
+    await assert.rejects(
+      () => publishSessionViaB({ persistence: b.persistence, sessionsRoot: b.sessionsRoot, candidate, bytes }),
+      err => err.code === 'B_UNSUPPORTED')
+    assert.equal(await b.persistence.stat(candidate.header.id), undefined, 'no session becomes visible')
+    const located = b.persistence.locate({ cwd: candidate.header.cwd, id: candidate.header.id })
+    assert.equal(statSync(located.path, { throwIfNoEntry: false }), undefined, 'the canonical name was never created')
+    const leftovers = readdirSync(dirname(located.path)).filter(n => n.startsWith('.migrate-'))
+    assert.deepEqual(leftovers, [], 'the private staging file is removed on refusal')
+  } finally {
+    fs.linkSync = origLink
+    await b.unmount()
+  }
+})
