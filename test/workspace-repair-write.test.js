@@ -281,3 +281,27 @@ test('repair write: a backup directory fsync EIO aborts before the unit is repla
     rmSync(dir, { recursive: true, force: true })
   }
 })
+
+test('repair write: exclusive backup collision preserves the existing backup and original unit', () => {
+  const { dir, unitPath, original, diff } = setup()
+  const sentinel = Buffer.from('synthetic existing backup must survive')
+  let existingBackup
+  try {
+    const fsOps = proxyFs({
+      onOpen: (path, flags) => {
+        if (typeof path === 'string' && path.includes('.bak-') && flags === 'wx') {
+          existingBackup = path
+          writeFileSync(existingBackup, sentinel)
+        }
+        return null
+      },
+    })
+    assert.throws(
+      () => applyWorkspaceRepairFile({ unitPath, unitBytes: original, diff, expectSha256: diff.unitSha256, engineStopped: true, fsOps }),
+      error => error.code === 'EEXIST')
+    assert.deepEqual(readFileSync(unitPath), original)
+    assert.deepEqual(readFileSync(existingBackup), sentinel)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
