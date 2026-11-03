@@ -19,9 +19,8 @@
 // is reported as blocked, and --apply refuses unless every duplicate is
 // resolved.
 import fs from 'node:fs'
-import { dirname, join } from 'node:path'
-import { randomUUID } from 'node:crypto'
-import { planWorkspaceRepair, applyWorkspaceRepair } from '../lib/import/workspace-repair.js'
+import { planWorkspaceRepair } from '../lib/import/workspace-repair.js'
+import { applyWorkspaceRepairFile } from '../lib/import/workspace-repair-write.js'
 
 function arg(name, fallback = null) {
   const index = process.argv.indexOf(name)
@@ -68,37 +67,21 @@ if (!diff.changed || diff.blocked.length > 0) {
   console.error('refusing to apply: every duplicate must have exactly one proven owner')
   process.exit(1)
 }
-const applied = applyWorkspaceRepair(unitBytes, diff, { expectSha256: expectSha })
-const stamp = new Date().toISOString().replace(/[:.]/g, '-')
-const backup = `${unitPath}.bak-${stamp}`
-fs.writeFileSync(backup, unitBytes, { mode: 0o600 })
-const temp = join(dirname(unitPath), `.workspace-repair-${randomUUID()}.tmp`)
-let fd
 try {
-  fd = fs.openSync(temp, 'wx', 0o600)
-  fs.writeSync(fd, applied.bytes)
-  fs.fsyncSync(fd)
-  fs.closeSync(fd)
-  fd = undefined
-  fs.renameSync(temp, unitPath)
-  try {
-    const dfd = fs.openSync(dirname(unitPath), 'r')
-    try { fs.fsyncSync(dfd) } catch { /* platform limitation */ }
-    finally { fs.closeSync(dfd) }
-  } catch { /* directory fsync unsupported */ }
-  const verified = fs.readFileSync(unitPath)
-  if (verified.length !== applied.bytes.length || !verified.equals(applied.bytes)) {
-    throw new Error('post-apply verification failed — restore the backup')
-  }
+  const result = applyWorkspaceRepairFile({
+    unitPath,
+    unitBytes,
+    diff,
+    expectSha256: expectSha,
+    engineStopped,
+  })
+  console.log(JSON.stringify({ ...result, removals: diff.removals }, null, 2))
+  process.exit(result.ok ? 0 : 1)
 } catch (error) {
-  try { if (fd !== undefined) fs.closeSync(fd) } catch { /* closed */ }
-  try { fs.unlinkSync(temp) } catch { /* nothing */ }
-  throw error
+  console.error(JSON.stringify({
+    mode: 'refused',
+    unitSha256: diff.unitSha256,
+    error: { code: error?.code ?? null, message: error?.message ?? String(error) },
+  }, null, 2))
+  process.exit(1)
 }
-console.log(JSON.stringify({
-  mode: 'applied',
-  backup,
-  beforeSha256: diff.unitSha256,
-  afterSha256: applied.sha256,
-  removals: diff.removals,
-}, null, 2))
