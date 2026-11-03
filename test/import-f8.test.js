@@ -23,6 +23,15 @@ function runtimeMarker() {
   return `F8TOKEN-${randomBytes(16).toString('hex')}`
 }
 
+// An uppercase-hex credential-shaped value that PASSES the old format-only
+// filter (first character must be a letter): 48 hex chars starting A–F.
+function credentialLikeHex() {
+  for (;;) {
+    const value = randomBytes(24).toString('hex').toUpperCase()
+    if (/^[A-F]/.test(value)) return value
+  }
+}
+
 // The leak scanner under test: returns the channels containing the marker.
 function scanForMarker(channels, marker) {
   const hits = []
@@ -219,10 +228,10 @@ test('P2 F6 adjacent: session logs with NUL bytes refuse (binary/truncated)', as
 // closed set of fixed constants from this package.
 test('P2 F8 residual: raw error code/name/stage with the marker are classified out of the public report', { skip: skip ? 'RC4_MODULES not set' : false }, async () => {
   const token = runtimeMarker()
-  // FORMAT-VALID negative control: an uppercase-hex credential payload with a
-  // letter prefix (like a fake `E_...` code) satisfies the old
-  // "uppercase/digit" format filter. The closed set must still reject it.
-  const credentialLikeCode = `E${randomBytes(23).toString('hex').toUpperCase()}`
+  // FORMAT-VALID negative control: a random uppercase-hex credential that
+  // starts with a letter satisfies the old "uppercase/digit" format filter.
+  // The closed set must still reject it.
+  const credentialLikeCode = credentialLikeHex()
   assert.match(credentialLikeCode, /^[A-Z][A-Z0-9_]{2,63}$/, 'precondition: the injected code passes the FORMAT filter')
   const dir = mkdtempSync(join(tmpdir(), 'f8-fields-'))
   try {
@@ -294,10 +303,10 @@ test('P2 F8: public error classification is a CLOSED SET (known constants only)'
   // known package constants pass through unchanged
   assert.equal(publicErrorCode({ code: 'IMPORT_PLAN_BINDING' }), 'IMPORT_PLAN_BINDING')
   assert.equal(publicErrorCode({ code: 'G6_SNAPSHOT_CORRUPT' }), 'G6_SNAPSHOT_CORRUPT')
-  // NEGATIVE CONTROL: format-valid but not in the set → fallback. An
-  // uppercase-hex credential with a letter prefix satisfied the old
-  // format-only filter.
-  const credentialLike = `E${randomBytes(23).toString('hex').toUpperCase()}`
+  // NEGATIVE CONTROL: format-valid but not in the set → fallback. A random
+  // uppercase-hex credential (letter-leading) satisfied the old format-only
+  // filter.
+  const credentialLike = credentialLikeHex()
   assert.match(credentialLike, /^[A-Z][A-Z0-9_]{2,63}$/, 'precondition: passes the old format filter')
   assert.equal(publicErrorCode({ code: credentialLike }), 'RUNTIME_FAILURE')
   assert.equal(publicErrorCode({ code: credentialLike }, 'ROLLBACK_FAILURE'), 'ROLLBACK_FAILURE')
