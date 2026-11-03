@@ -10,7 +10,7 @@ import { join, relative, sep } from 'node:path'
 import { createHash } from 'node:crypto'
 import { createRequire } from 'node:module'
 import { pathToFileURL } from 'node:url'
-import { runImportJob } from '../lib/import/job.js'
+import { runImportJob, assertNoDuplicateWorkspaceMembership } from '../lib/import/job.js'
 import { buildPlan, freezePlan } from '../lib/import/plan.js'
 import { ImportJournal } from '../lib/import/journal.js'
 import { createJsonlWithdrawalAdapter } from '../lib/import/withdraw.js'
@@ -702,4 +702,13 @@ test("P2 M4 mapping: the approved plan's cwdMapping rewrites the write header, n
     await t.unmount()
     rmSync(jobDir, { recursive: true, force: true })
   }
+})
+
+test('P2 R5: a second workspace membership for one session is refused before attach', () => {
+  const registry = { list: () => [{ id: 'ws-a', sessionIds: ['s1'] }, { id: 'ws-b', sessionIds: [] }] }
+  assert.throws(
+    () => assertNoDuplicateWorkspaceMembership(registry, 'ws-b', 's1'),
+    err => err.code === 'IMPORT_WORKSPACE_DUPLICATE')
+  assert.doesNotThrow(() => assertNoDuplicateWorkspaceMembership(registry, 'ws-a', 's1'))
+  assert.doesNotThrow(() => assertNoDuplicateWorkspaceMembership(registry, 'ws-b', 's2'))
 })
