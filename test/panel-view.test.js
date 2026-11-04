@@ -15,6 +15,6 @@ test('product panel idle view exposes the large-backup entry and stays within th
 test('product panel idle view is bilingual and does not expose a raw /sdcard path as a migration source', () => {
   const view = migrationView(null, { locale: 'en' })
   const text = JSON.stringify(view)
-  assert.match(text, /Browse Download\/DSHA/)
+  assert.match(text, /Choose from DSHA/)
   assert.ok(!text.includes('preparePath'), 'internal controller method must not leak into the view')
 })
