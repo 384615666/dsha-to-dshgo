@@ -7,10 +7,9 @@
   "main": "lib/index.js",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/384615666/dsha-to-dshgo.git",
-    "directory": "dsh-dsha-migrator"
+    "url": "git+https://github.com/384615666/dsha-to-dshgo.git"
   },
-  "homepage": "https://github.com/384615666/dsha-to-dshgo/tree/main/dsh-dsha-migrator#readme",
+  "homepage": "https://github.com/384615666/dsha-to-dshgo#readme",
   "bugs": {
     "url": "https://github.com/384615666/dsha-to-dshgo/issues"
   },
